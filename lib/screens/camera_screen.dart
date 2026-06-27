@@ -22,6 +22,7 @@ class _CameraScreenState extends State<CameraScreen>
   CameraController? _cameraController;
   Future<void>? _cameraInit;
   late final AnimationController _pulse;
+  bool _showWaitingOverlay = false;
   bool _streamActive = false;
   bool _streamOpInFlight = false;
 
@@ -46,9 +47,13 @@ class _CameraScreenState extends State<CameraScreen>
       cameras.first,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21,
+      imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.nv21 : ImageFormatGroup.bgra8888,
     );
     await _cameraController!.initialize();
+    await _setImageStreamActive(true);
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   @override
@@ -64,8 +69,7 @@ class _CameraScreenState extends State<CameraScreen>
     }
 
     if (state == AppLifecycleState.resumed) {
-      final bool shouldStream = context.read<CameraProvider>().appState == AppState.capture;
-      unawaited(_setImageStreamActive(shouldStream));
+      unawaited(_setImageStreamActive(true));
     }
   }
 
@@ -127,21 +131,6 @@ class _CameraScreenState extends State<CameraScreen>
     return const Color(0xFFE53935);
   }
 
-  Future<void> _setPoint(CameraProvider provider) async {
-    final ok = await provider.setPoint(
-      provider.currentLatitude,
-      provider.currentLongitude,
-      provider.currentBearing,
-    );
-    if (!mounted) {
-      return;
-    }
-    if (!ok) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text(provider.lastError ?? 'Set point failed')));
-    }
-  }
-
   Future<void> _capturePhoto(CameraProvider provider) async {
     if (_cameraController == null) {
       return;
@@ -153,16 +142,54 @@ class _CameraScreenState extends State<CameraScreen>
       await provider.captureImage(_cameraController!);
 
       if (mounted) {
-        await _setImageStreamActive(provider.appState == AppState.capture);
+        await _setImageStreamActive(true);
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
       }
       if (mounted) {
-        await _setImageStreamActive(provider.appState == AppState.capture);
+        await _setImageStreamActive(true);
       }
     }
+  }
+
+  void _showWaitingOverlayState(bool show) {
+    if (!mounted || _showWaitingOverlay == show) {
+      return;
+    }
+    setState(() {
+      _showWaitingOverlay = show;
+    });
+  }
+
+  Future<void> _handleSetPoint(CameraProvider provider) async {
+    if (!provider.hasDepthFrame) {
+      _showWaitingOverlayState(true);
+      await provider.waitForFirstDepthFrame();
+      _showWaitingOverlayState(false);
+    }
+
+    final bool success = await provider.setDepthPoint();
+    if (!success) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Camera not ready. Try again.'),
+          duration: const Duration(seconds: 1),
+          backgroundColor: Colors.red.withValues(alpha: 0.8),
+        ),
+      );
+      return;
+    }
+
+    await provider.switchToCaptureState(
+      provider.currentLatitude,
+      provider.currentLongitude,
+      provider.currentBearing,
+    );
   }
 
   Future<void> _openTargetDistanceDialog(CameraProvider provider) async {
@@ -286,12 +313,6 @@ class _CameraScreenState extends State<CameraScreen>
       builder: (context, provider, _) {
         final bool capture = provider.appState == AppState.capture;
         final bool firstPhotoPending = capture && !provider.showAngleHeightGuides;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted) {
-            return;
-          }
-          unawaited(_setImageStreamActive(capture));
-        });
 
         return Scaffold(
           backgroundColor: Colors.black,
@@ -392,6 +413,34 @@ class _CameraScreenState extends State<CameraScreen>
                       ),
                     ),
                   ),
+                  if (_showWaitingOverlay)
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: Center(
+                          child: GlassContainer(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                            child: const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2.2,
+                                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                  ),
+                                ),
+                                SizedBox(width: 12),
+                                Text(
+                                  'Initializing camera...',
+                                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               );
             },
@@ -402,6 +451,7 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   Widget _buildInitialBar(CameraProvider provider) {
+    final bool hasFrame = provider.hasDepthFrame;
     return GlassContainer(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       child: Row(
@@ -411,23 +461,37 @@ class _CameraScreenState extends State<CameraScreen>
             onPressed: () => _openTargetDistanceDialog(provider),
             icon: const Icon(Icons.straighten, color: Colors.white),
           ),
-          GestureDetector(
-            onTap: () => _setPoint(provider),
-            child: Container(
-              width: 72,
-              height: 72,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: const Color(0xFF00BCD4),
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFF00BCD4).withValues(alpha: 0.55 * _pulse.value),
-                    blurRadius: 18,
-                    spreadRadius: 2,
+          Tooltip(
+            message: hasFrame ? 'Set Point' : 'Waiting for camera...',
+            child: GestureDetector(
+              onTap: hasFrame ? () => _handleSetPoint(provider) : null,
+              child: Opacity(
+                opacity: hasFrame ? 1.0 : 0.5,
+                child: Container(
+                  width: 72,
+                  height: 72,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0xFF00BCD4),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF00BCD4).withValues(alpha: 0.55 * _pulse.value),
+                        blurRadius: 18,
+                        spreadRadius: 2,
+                      ),
+                    ],
                   ),
-                ],
+                  child: hasFrame
+                      ? const Icon(Icons.place, color: Colors.white, size: 34)
+                      : const Padding(
+                          padding: EdgeInsets.all(26),
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                          ),
+                        ),
+                ),
               ),
-              child: const Icon(Icons.place, color: Colors.white, size: 34),
             ),
           ),
           IconButton.filledTonal(

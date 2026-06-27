@@ -21,8 +21,10 @@ class DepthService extends ChangeNotifier {
 
   final ObjectDetector _detector;
 
-  CameraImage? _latestFrame;
-  int _latestSensorOrientation = 0;
+  final StreamController<bool> _frameReadyController = StreamController<bool>.broadcast();
+
+  CameraImage? _lastFrame;
+  int _sensorOrientation = 0;
 
   bool _isCalibrated = false;
   bool _isProcessing = false;
@@ -39,9 +41,10 @@ class DepthService extends ChangeNotifier {
   String? _warningMessage;
   bool _isUsingFallback = false;
 
-  DateTime _lastProcessedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _lastProcessed;
   DateTime _lastCenterObjectAt = DateTime.fromMillisecondsSinceEpoch(0);
 
+  bool get hasFrame => _lastFrame != null;
   bool get hasAnchor => _isCalibrated;
   bool get isCalibrated => _isCalibrated;
   double get currentDistanceCm => _currentDistanceCm;
@@ -49,35 +52,52 @@ class DepthService extends ChangeNotifier {
   String? get warningMessage => _warningMessage;
   bool get isUsingFallback => _isUsingFallback;
 
-  void updateLatestFrame(
+  void onCameraImage(
     CameraImage image, {
     required int sensorOrientation,
   }) {
-    _latestFrame = image;
-    _latestSensorOrientation = sensorOrientation;
+    _lastFrame = image;
+    _sensorOrientation = sensorOrientation;
+
+    if (!_frameReadyController.isClosed) {
+      _frameReadyController.add(true);
+    }
 
     if (!_isCalibrated || _isProcessing) {
       return;
     }
 
     final DateTime now = DateTime.now();
-    if (now.difference(_lastProcessedAt) < _minProcessInterval) {
+    if (_lastProcessed != null && now.difference(_lastProcessed!) < _minProcessInterval) {
       return;
     }
 
+    _lastProcessed = now;
     _isProcessing = true;
-    unawaited(_processLatestFrame(now));
+    unawaited(_processFrame(image, now));
   }
 
-  Future<bool> calibrateAtSetPoint({required double targetDistanceCm}) async {
-    final CameraImage? frame = _latestFrame;
-    if (frame == null) {
-      _warningMessage = 'No camera frame available yet.';
-      notifyListeners();
+  Future<void> waitForFirstFrame() async {
+    if (hasFrame) {
+      return;
+    }
+    await _frameReadyController.stream
+        .timeout(
+          const Duration(seconds: 3),
+          onTimeout: (sink) => sink.close(),
+        )
+        .first
+        .catchError((_) => false);
+  }
+
+  Future<bool> setPoint({required double targetDistanceCm}) async {
+    if (!hasFrame) {
       return false;
     }
 
-    final InputImage? inputImage = _toInputImage(frame, _latestSensorOrientation);
+    final CameraImage frame = _lastFrame!;
+
+    final InputImage? inputImage = _convertCameraImage(frame);
     if (inputImage == null) {
       _warningMessage = 'Camera format not supported for ML detection.';
       notifyListeners();
@@ -104,7 +124,7 @@ class DepthService extends ChangeNotifier {
     _warningMessage = null;
     _isUsingFallback = false;
     _lastCenterObjectAt = DateTime.now();
-    _lastProcessedAt = DateTime.fromMillisecondsSinceEpoch(0);
+    _lastProcessed = null;
     notifyListeners();
     return true;
   }
@@ -119,19 +139,18 @@ class DepthService extends ChangeNotifier {
     _scale = 1.0;
     _warningMessage = null;
     _isUsingFallback = false;
-    _lastProcessedAt = DateTime.fromMillisecondsSinceEpoch(0);
+    _lastProcessed = null;
     _lastCenterObjectAt = DateTime.fromMillisecondsSinceEpoch(0);
     notifyListeners();
   }
 
-  Future<void> _processLatestFrame(DateTime now) async {
+  Future<void> _processFrame(CameraImage frame, DateTime now) async {
     try {
-      final CameraImage? frame = _latestFrame;
-      if (frame == null || !_isCalibrated) {
+      if (!_isCalibrated) {
         return;
       }
 
-      final InputImage? inputImage = _toInputImage(frame, _latestSensorOrientation);
+      final InputImage? inputImage = _convertCameraImage(frame);
       if (inputImage == null) {
         return;
       }
@@ -178,13 +197,12 @@ class DepthService extends ChangeNotifier {
 
       notifyListeners();
     } finally {
-      _lastProcessedAt = now;
       _isProcessing = false;
     }
   }
 
-  InputImage? _toInputImage(CameraImage image, int sensorOrientation) {
-    final InputImageRotation rotation = InputImageRotationValue.fromRawValue(sensorOrientation) ??
+  InputImage? _convertCameraImage(CameraImage image) {
+    final InputImageRotation rotation = InputImageRotationValue.fromRawValue(_sensorOrientation) ??
         InputImageRotation.rotation0deg;
 
     final InputImageFormat? format = InputImageFormatValue.fromRawValue(image.format.raw);
@@ -271,6 +289,7 @@ class DepthService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _frameReadyController.close();
     _detector.close();
     super.dispose();
   }

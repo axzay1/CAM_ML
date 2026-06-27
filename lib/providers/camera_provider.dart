@@ -87,6 +87,8 @@ class CameraProvider extends ChangeNotifier {
 
   bool get hasAnchor => _depthService.hasAnchor;
 
+  bool get hasDepthFrame => _depthService.hasFrame;
+
   double get currentScale => _depthService.currentScale;
 
   String? get trackingWarning => _depthService.warningMessage;
@@ -121,10 +123,18 @@ class CameraProvider extends ChangeNotifier {
   }
 
   void processCameraFrame(CameraImage image, int sensorOrientation) {
-    _depthService.updateLatestFrame(
+    _depthService.onCameraImage(
       image,
       sensorOrientation: sensorOrientation,
     );
+  }
+
+  Future<void> waitForFirstDepthFrame() {
+    return _depthService.waitForFirstFrame();
+  }
+
+  Future<bool> setDepthPoint() {
+    return _depthService.setPoint(targetDistanceCm: targetDistanceCm);
   }
 
   Future<void> _initialize() async {
@@ -198,12 +208,18 @@ class CameraProvider extends ChangeNotifier {
   }
 
   Future<bool> setPoint(double lat, double lng, double bearing) async {
-    final bool anchorReady = await _depthService.calibrateAtSetPoint(targetDistanceCm: targetDistanceCm);
+    final bool anchorReady = await setDepthPoint();
     if (!anchorReady) {
       lastError = _depthService.warningMessage ?? 'No center object detected.';
       _scheduleNotify(immediate: true);
       return false;
     }
+
+    await switchToCaptureState(lat, lng, bearing);
+    return true;
+  }
+
+  Future<void> switchToCaptureState(double lat, double lng, double bearing) async {
 
     final Album album = Album(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -225,7 +241,6 @@ class CameraProvider extends ChangeNotifier {
     await _albumService.saveAlbum(album);
     _recomputeSpatialValues();
     _scheduleNotify(immediate: true);
-    return true;
   }
 
   Future<void> captureImage(CameraController controller) async {

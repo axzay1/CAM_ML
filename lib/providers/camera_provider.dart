@@ -67,6 +67,10 @@ class CameraProvider extends ChangeNotifier {
 
   bool get canUpload => currentAlbum?.isComplete == true;
 
+  bool get isCalibrating => _spatialService.isCalibrating;
+
+  bool get shouldShowDriftWarning => appState == AppState.capture && _spatialService.shouldRecommendReset;
+
   bool isAlbumUploaded(String albumId) => _uploadedAlbumIds.contains(albumId);
 
   double get bearingDelta {
@@ -93,7 +97,7 @@ class CameraProvider extends ChangeNotifier {
     ).listen((Position position) {
       currentLatitude = position.latitude;
       currentLongitude = position.longitude;
-      _recomputeSpatialValues();
+      notifyListeners();
     });
 
     _initialized = true;
@@ -107,13 +111,8 @@ class CameraProvider extends ChangeNotifier {
 
   void _recomputeSpatialValues() {
     if (currentAlbum != null) {
-      currentDistanceCm = _spatialService.haversineDistanceCm(
-        currentLatitude,
-        currentLongitude,
-        currentAlbum!.anchorLat,
-        currentAlbum!.anchorLng,
-      );
-      currentHeightDelta = _spatialService.calculateHeightDeltaCm(currentDistanceCm);
+      currentDistanceCm = _spatialService.distanceCm;
+      currentHeightDelta = _spatialService.heightDeltaCm;
     } else {
       currentDistanceCm = 0.0;
       currentHeightDelta = 0.0;
@@ -121,7 +120,9 @@ class CameraProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setPoint(double lat, double lng, double bearing) {
+  Future<void> setPoint(double lat, double lng, double bearing) async {
+    await _spatialService.calibrateAtSetPoint();
+
     final Album album = Album(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
       name: 'Album ${albums.length + 1}',
@@ -134,10 +135,9 @@ class CameraProvider extends ChangeNotifier {
 
     currentAlbum = album;
     appState = AppState.capture;
-    _spatialService.lockAnchorPitch();
 
     albums.insert(0, album);
-    _albumService.saveAlbum(album);
+    await _albumService.saveAlbum(album);
     _recomputeSpatialValues();
   }
 
@@ -234,6 +234,11 @@ class CameraProvider extends ChangeNotifier {
       resetToInitial();
     }
     notifyListeners();
+  }
+
+  void resetPosition() {
+    _spatialService.resetPosition();
+    _recomputeSpatialValues();
   }
 
   void resetToInitial() {

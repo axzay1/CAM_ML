@@ -1,21 +1,42 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:vector_math/vector_math_64.dart' as vm;
 
 class SpatialService extends ChangeNotifier {
   StreamSubscription<CompassEvent>? _compassSub;
   StreamSubscription<AccelerometerEvent>? _accelSub;
 
+  vm.Vector3 _position = vm.Vector3.zero();
+  vm.Vector3 _velocity = vm.Vector3.zero();
+  vm.Vector3 _baselineGravity = vm.Vector3.zero();
+  DateTime _lastTime = DateTime.now();
+  DateTime? _sessionStartedAt;
+
+  final List<vm.Vector3> _calibrationSamples = <vm.Vector3>[];
+  DateTime? _calibrationStartedAt;
+  Completer<void>? _calibrationCompleter;
+  bool _isCalibrating = false;
+
   double _latestBearing = 0.0;
-  double _latestPitchDeg = 0.0;
-  double _anchorPitchDeg = 0.0;
+  int _stillnessCount = 0;
 
   double get currentBearing => _latestBearing;
 
-  double get currentPitchDeg => _latestPitchDeg;
+  bool get isCalibrating => _isCalibrating;
+
+  double get distanceCm => _position.length * 100.0;
+
+  double get heightDeltaCm => _position.z * 100.0;
+
+  bool get shouldRecommendReset {
+    if (_sessionStartedAt == null) {
+      return false;
+    }
+    return DateTime.now().difference(_sessionStartedAt!) >= const Duration(minutes: 3);
+  }
 
   void start() {
     _compassSub ??= FlutterCompass.events?.listen((event) {
@@ -24,42 +45,88 @@ class SpatialService extends ChangeNotifier {
       notifyListeners();
     });
 
-    _accelSub ??= accelerometerEventStream().listen((event) {
-      final double pitchRad = math.atan2(event.y, event.z);
-      _latestPitchDeg = pitchRad * 180.0 / math.pi;
-      notifyListeners();
-    });
+    _accelSub ??= accelerometerEventStream(
+      samplingPeriod: SensorInterval.fastestInterval,
+    ).listen(_onAccelerometerEvent);
   }
 
-  void lockAnchorPitch() {
-    _anchorPitchDeg = _latestPitchDeg;
+  Future<void> calibrateAtSetPoint() async {
+    _position = vm.Vector3.zero();
+    _velocity = vm.Vector3.zero();
+    _stillnessCount = 0;
+    _lastTime = DateTime.now();
+
+    _calibrationSamples.clear();
+    _calibrationStartedAt = DateTime.now();
+    _isCalibrating = true;
+
+    final completer = Completer<void>();
+    _calibrationCompleter = completer;
+    notifyListeners();
+
+    await completer.future;
+    _sessionStartedAt = DateTime.now();
+    _lastTime = DateTime.now();
+    _isCalibrating = false;
+    notifyListeners();
   }
 
-  double calculateHeightDeltaCm(double distanceCm) {
-    final double pitchDelta = _latestPitchDeg - _anchorPitchDeg;
-    return math.sin(pitchDelta * math.pi / 180.0) * distanceCm;
+  void resetPosition() {
+    _position = vm.Vector3.zero();
+    _velocity = vm.Vector3.zero();
+    _stillnessCount = 0;
+    _lastTime = DateTime.now();
+    notifyListeners();
   }
 
-  double haversineDistanceCm(
-    double lat1,
-    double lng1,
-    double lat2,
-    double lng2,
-  ) {
-    const double earthRadiusM = 6371000.0;
-    final double dLat = _degToRad(lat2 - lat1);
-    final double dLng = _degToRad(lng2 - lng1);
+  void _onAccelerometerEvent(AccelerometerEvent event) {
+    final vm.Vector3 raw = vm.Vector3(event.x, event.y, event.z);
 
-    final double a =
-        math.sin(dLat / 2) * math.sin(dLat / 2) +
-        math.cos(_degToRad(lat1)) *
-            math.cos(_degToRad(lat2)) *
-            math.sin(dLng / 2) *
-            math.sin(dLng / 2);
+    if (_isCalibrating) {
+      _calibrationSamples.add(raw);
+      final bool enoughSamples = _calibrationSamples.length >= 50;
+      final bool enoughTime = _calibrationStartedAt != null &&
+          DateTime.now().difference(_calibrationStartedAt!) >= const Duration(seconds: 2);
 
-    final double c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
-    final double meters = earthRadiusM * c;
-    return meters * 100.0;
+      if (enoughSamples && enoughTime) {
+        final vm.Vector3 sum = _calibrationSamples.fold(
+          vm.Vector3.zero(),
+          (acc, v) => acc + v,
+        );
+        _baselineGravity = sum / _calibrationSamples.length.toDouble();
+        _calibrationSamples.clear();
+        _calibrationCompleter?.complete();
+      }
+      return;
+    }
+
+    final DateTime now = DateTime.now();
+    final double dt = now.difference(_lastTime).inMilliseconds / 1000.0;
+    _lastTime = now;
+    if (dt <= 0 || dt > 0.2) {
+      return;
+    }
+
+    vm.Vector3 acceleration = raw - _baselineGravity;
+
+    if (acceleration.length < 0.08) {
+      acceleration = vm.Vector3.zero();
+    }
+
+    _velocity += acceleration * dt;
+    _position += _velocity * dt;
+    _velocity *= 0.95;
+
+    if (acceleration.length < 0.05) {
+      _stillnessCount += 1;
+      if (_stillnessCount >= 30) {
+        _velocity = vm.Vector3.zero();
+      }
+    } else {
+      _stillnessCount = 0;
+    }
+
+    notifyListeners();
   }
 
   bool isInPosition({
@@ -69,7 +136,7 @@ class SpatialService extends ChangeNotifier {
     required double anchorBearing,
     required double currentHeightDelta,
   }) {
-    final bool distanceOk = (currentDistanceCm - targetDistanceCm).abs() <= 15.0;
+    final bool distanceOk = (currentDistanceCm - targetDistanceCm).abs() <= 20.0;
     final bool bearingOk = _bearingDifference(currentBearing, anchorBearing).abs() <= 5.0;
     final bool heightOk = currentHeightDelta.abs() <= 10.0;
     return distanceOk && bearingOk && heightOk;
@@ -88,8 +155,6 @@ class SpatialService extends ChangeNotifier {
     final double normalized = angle % 360.0;
     return normalized < 0 ? normalized + 360.0 : normalized;
   }
-
-  double _degToRad(double degrees) => degrees * math.pi / 180.0;
 
   @override
   void dispose() {

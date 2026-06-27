@@ -3,10 +3,10 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('SpatialService calculations', () {
-    test('haversine distance in cm is positive', () {
+    test('bearing delta wraps correctly', () {
       final service = SpatialService();
-      final distance = service.haversineDistanceCm(12.34, 56.78, 12.3405, 56.7810);
-      expect(distance, greaterThan(0));
+      final delta = service.bearingDelta(5, 355);
+      expect(delta, closeTo(10, 0.001));
     });
 
     test('tolerance check succeeds when all deltas are inside threshold', () {

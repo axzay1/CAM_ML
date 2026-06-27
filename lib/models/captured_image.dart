@@ -1,30 +1,43 @@
-import 'package:flutter/foundation.dart';
-
-@immutable
 class CapturedImage {
-  final String path;
-  final double latitude;
-  final double longitude;
-  final double distance;
-  final double angle;
-  final DateTime timestamp;
-  final String albumId;
-  final String albumName;
-
   const CapturedImage({
-    required this.path,
+    required this.imagePath,
     required this.latitude,
     required this.longitude,
-    required this.distance,
-    required this.angle,
+    required this.distanceCm,
+    required this.bearingAngle,
+    required this.heightDelta,
     required this.timestamp,
-    this.albumId = '',
-    this.albumName = 'General',
   });
 
-  String get latitudeString => latitude.toStringAsFixed(5);
-  String get longitudeString => longitude.toStringAsFixed(5);
-  String get distanceString => '${distance.toStringAsFixed(1)} m';
-  String get angleString => '${angle.toStringAsFixed(0)}°';
-  String get timestampString => timestamp.toLocal().toString();
+  final String imagePath;
+  final double latitude;
+  final double longitude;
+  final double distanceCm;
+  final double bearingAngle;
+  final double heightDelta;
+  final DateTime timestamp;
+
+  Map<String, dynamic> toMap() {
+    return {
+      'imagePath': imagePath,
+      'latitude': latitude,
+      'longitude': longitude,
+      'distanceCm': distanceCm,
+      'bearingAngle': bearingAngle,
+      'heightDelta': heightDelta,
+      'timestamp': timestamp.toIso8601String(),
+    };
+  }
+
+  factory CapturedImage.fromMap(Map<dynamic, dynamic> map) {
+    return CapturedImage(
+      imagePath: map['imagePath'] as String,
+      latitude: (map['latitude'] as num).toDouble(),
+      longitude: (map['longitude'] as num).toDouble(),
+      distanceCm: (map['distanceCm'] as num).toDouble(),
+      bearingAngle: (map['bearingAngle'] as num).toDouble(),
+      heightDelta: (map['heightDelta'] as num).toDouble(),
+      timestamp: DateTime.parse(map['timestamp'] as String),
+    );
+  }
 }

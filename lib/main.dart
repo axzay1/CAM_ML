@@ -1,25 +1,31 @@
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
-import 'providers/camera_app_state.dart';
+import 'providers/camera_provider.dart';
 import 'screens/camera_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final cameras = await availableCameras();
-  runApp(MyApp(cameras: cameras));
+
+  await Hive.initFlutter();
+  await [
+    Permission.camera,
+    Permission.locationWhenInUse,
+    Permission.sensors,
+  ].request();
+
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key, required this.cameras});
-
-  final List<CameraDescription> cameras;
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
-      create: (_) => CameraAppState(cameras),
+      create: (_) => CameraProvider(),
       child: MaterialApp(
         title: 'CAM_ML',
         debugShowCheckedModeBanner: false,

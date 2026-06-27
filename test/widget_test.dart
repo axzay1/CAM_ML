@@ -1,30 +1,25 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-
-import 'package:cam_ml/main.dart';
+import 'package:cam_ml/models/captured_image.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(MyApp(cameras: const []));
+  test('CapturedImage map conversion is stable', () {
+    final original = CapturedImage(
+      imagePath: '/tmp/a.jpg',
+      latitude: 1.23,
+      longitude: 4.56,
+      distanceCm: 150.0,
+      bearingAngle: 90.0,
+      heightDelta: 8.0,
+      timestamp: DateTime.parse('2026-01-01T00:00:00.000Z'),
+    );
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    final restored = CapturedImage.fromMap(original.toMap());
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(restored.imagePath, original.imagePath);
+    expect(restored.latitude, original.latitude);
+    expect(restored.longitude, original.longitude);
+    expect(restored.distanceCm, original.distanceCm);
+    expect(restored.bearingAngle, original.bearingAngle);
+    expect(restored.heightDelta, original.heightDelta);
   });
 }

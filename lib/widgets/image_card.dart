@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
 
 import '../models/captured_image.dart';
 
@@ -19,16 +20,16 @@ class ImageCard extends StatelessWidget {
         leading: ClipRRect(
           borderRadius: BorderRadius.circular(8),
           child: Image.file(
-            File(image.path),
+            File(image.imagePath),
             width: 64,
             height: 64,
             fit: BoxFit.cover,
             errorBuilder: (_, _, _) => const Icon(Icons.broken_image),
           ),
         ),
-        title: Text('${image.latitudeString}, ${image.longitudeString}'),
+        title: Text('${image.latitude.toStringAsFixed(5)}, ${image.longitude.toStringAsFixed(5)}'),
         subtitle: Text(
-          'Album: ${image.albumName}\nDist: ${image.distanceString} • Angle: ${image.angleString}\n${image.timestamp.toLocal()}',
+          'Dist: ${image.distanceCm.toStringAsFixed(0)}cm • Bearing: ${image.bearingAngle.toStringAsFixed(0)}°\nHeight: ${image.heightDelta.toStringAsFixed(0)}cm\n${DateFormat('yyyy-MM-dd HH:mm').format(image.timestamp)}',
           style: const TextStyle(fontSize: 12),
         ),
         isThreeLine: true,

@@ -4,11 +4,11 @@ import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:vector_math/vector_math_64.dart' as vm;
 
 import '../models/album.dart';
 import '../models/captured_image.dart';
 import '../services/album_service.dart';
+import '../services/depth_service.dart';
 import '../services/drive_service.dart';
 import '../services/spatial_service.dart';
 
@@ -19,15 +19,18 @@ class CameraProvider extends ChangeNotifier {
     SpatialService? spatialService,
     AlbumService? albumService,
     DriveService? driveService,
+    DepthService? depthService,
   })  : _spatialService = spatialService ?? SpatialService(),
         _albumService = albumService ?? AlbumService(),
-        _driveService = driveService ?? DriveService() {
+        _driveService = driveService ?? DriveService(),
+        _depthService = depthService ?? DepthService() {
     _initialize();
   }
 
   final SpatialService _spatialService;
   final AlbumService _albumService;
   final DriveService _driveService;
+  final DepthService _depthService;
 
   StreamSubscription<Position>? _positionSubscription;
 
@@ -37,7 +40,7 @@ class CameraProvider extends ChangeNotifier {
 
   double currentDistanceCm = 0.0;
   double currentBearing = 0.0;
-  double currentHeightDelta = 0.0;
+  double currentPitch = 0.0;
   double targetDistanceCm = 150.0;
 
   double currentLatitude = 0.0;
@@ -53,34 +56,44 @@ class CameraProvider extends ChangeNotifier {
 
   final Set<String> _uploadedAlbumIds = <String>{};
 
+  static const Duration _minUiNotifyInterval = Duration(milliseconds: 66);
+  DateTime _lastNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
+  Timer? _notifyTimer;
+
+  double? _referenceScale;
+  double? _referenceBearing;
+  double? _referencePitch;
+
   bool get isInPosition {
     if (currentAlbum == null) {
       return false;
     }
-    return _spatialService.isInPosition(
-      currentDistanceCm: currentDistanceCm,
-      targetDistanceCm: targetDistanceCm,
-      currentBearing: currentBearing,
-      anchorBearing: currentAlbum!.anchorBearing,
-      currentHeightDelta: currentHeightDelta,
-    );
+
+    if (currentAlbum!.images.isEmpty) {
+      return (currentDistanceCm - targetDistanceCm).abs() <= 10.0;
+    }
+
+    if (_referenceScale == null || _referenceBearing == null || _referencePitch == null) {
+      return false;
+    }
+
+    final bool scaleOk = ((_depthService.currentScale - _referenceScale!).abs() / _referenceScale!) <= 0.08;
+    final bool bearingOk = _spatialService.withinBearingTolerance(currentBearing, _referenceBearing!, tolerance: 3.0);
+    final bool pitchOk = _spatialService.withinPitchTolerance(currentPitch, _referencePitch!, tolerance: 3.0);
+    return scaleOk && bearingOk && pitchOk;
   }
 
   bool get canUpload => currentAlbum?.isComplete == true;
 
-  bool get isCalibrating => _spatialService.isCalibrating;
+  bool get hasAnchor => _depthService.hasAnchor;
 
-  bool get shouldShowDriftWarning => appState == AppState.capture && _spatialService.shouldRecommendReset;
+  double get currentScale => _depthService.currentScale;
 
-  vm.Vector3 get rawAcceleration => _spatialService.rawAcceleration;
+  String? get trackingWarning => _depthService.warningMessage;
 
-  vm.Vector3 get gatedAcceleration => _spatialService.gatedAcceleration;
+  bool get isUsingFallbackTracking => _depthService.isUsingFallback;
 
-  double get velocityMagnitude => _spatialService.velocityMagnitude;
-
-  int get stillCount => _spatialService.stillCount;
-
-  int get calibrationCount => _spatialService.calibrationCount;
+  bool get showAngleHeightGuides => currentAlbum != null && currentAlbum!.images.isNotEmpty;
 
   bool isAlbumUploaded(String albumId) => _uploadedAlbumIds.contains(albumId);
 
@@ -93,9 +106,31 @@ class CameraProvider extends ChangeNotifier {
 
   double get distanceDelta => currentDistanceCm - targetDistanceCm;
 
+  double get pitchDelta => (_referencePitch == null) ? 0.0 : (currentPitch - _referencePitch!);
+
+  double get scaleDeltaPercent {
+    if (_referenceScale == null || _referenceScale == 0) {
+      return 0.0;
+    }
+    return ((_depthService.currentScale - _referenceScale!) / _referenceScale!) * 100.0;
+  }
+
+  double get scaleBarNormalized {
+    final double delta = (currentDistanceCm - targetDistanceCm) / 200.0;
+    return (0.5 + delta).clamp(0.0, 1.0);
+  }
+
+  void processCameraFrame(CameraImage image, int sensorOrientation) {
+    _depthService.updateLatestFrame(
+      image,
+      sensorOrientation: sensorOrientation,
+    );
+  }
+
   Future<void> _initialize() async {
     _spatialService.start();
     _spatialService.addListener(_onSpatialChange);
+    _depthService.addListener(_onDepthChange);
 
     await _albumService.init();
     albums = _albumService.getAllAlbums();
@@ -108,31 +143,67 @@ class CameraProvider extends ChangeNotifier {
     ).listen((Position position) {
       currentLatitude = position.latitude;
       currentLongitude = position.longitude;
-      notifyListeners();
+      _scheduleNotify();
     });
 
     _initialized = true;
-    notifyListeners();
+    _scheduleNotify(immediate: true);
   }
 
   void _onSpatialChange() {
     currentBearing = _spatialService.currentBearing;
+    currentPitch = _spatialService.currentPitch;
+    _recomputeSpatialValues();
+  }
+
+  void _onDepthChange() {
     _recomputeSpatialValues();
   }
 
   void _recomputeSpatialValues() {
     if (currentAlbum != null) {
-      currentDistanceCm = _spatialService.distanceCm;
-      currentHeightDelta = _spatialService.heightDeltaCm;
+      currentDistanceCm = _depthService.currentDistanceCm;
     } else {
       currentDistanceCm = 0.0;
-      currentHeightDelta = 0.0;
     }
-    notifyListeners();
+    _scheduleNotify();
   }
 
-  Future<void> setPoint(double lat, double lng, double bearing) async {
-    await _spatialService.calibrateAtSetPoint();
+  void _scheduleNotify({bool immediate = false}) {
+    if (immediate) {
+      _notifyTimer?.cancel();
+      _notifyTimer = null;
+      _lastNotifyAt = DateTime.now();
+      notifyListeners();
+      return;
+    }
+
+    final DateTime now = DateTime.now();
+    final Duration elapsed = now.difference(_lastNotifyAt);
+    if (elapsed >= _minUiNotifyInterval) {
+      _lastNotifyAt = now;
+      notifyListeners();
+      return;
+    }
+
+    if (_notifyTimer != null) {
+      return;
+    }
+
+    _notifyTimer = Timer(_minUiNotifyInterval - elapsed, () {
+      _notifyTimer = null;
+      _lastNotifyAt = DateTime.now();
+      notifyListeners();
+    });
+  }
+
+  Future<bool> setPoint(double lat, double lng, double bearing) async {
+    final bool anchorReady = await _depthService.calibrateAtSetPoint(targetDistanceCm: targetDistanceCm);
+    if (!anchorReady) {
+      lastError = _depthService.warningMessage ?? 'No center object detected.';
+      _scheduleNotify(immediate: true);
+      return false;
+    }
 
     final Album album = Album(
       id: DateTime.now().microsecondsSinceEpoch.toString(),
@@ -146,22 +217,27 @@ class CameraProvider extends ChangeNotifier {
 
     currentAlbum = album;
     appState = AppState.capture;
+    _referenceScale = null;
+    _referenceBearing = null;
+    _referencePitch = null;
 
     albums.insert(0, album);
     await _albumService.saveAlbum(album);
     _recomputeSpatialValues();
+    _scheduleNotify(immediate: true);
+    return true;
   }
 
   Future<void> captureImage(CameraController controller) async {
     if (!isInPosition) {
       lastError = 'You are not in position yet. Align distance, bearing, and height.';
-      notifyListeners();
+      _scheduleNotify(immediate: true);
       throw Exception(lastError);
     }
 
     if (currentAlbum == null) {
       lastError = 'No active album. Set point first.';
-      notifyListeners();
+      _scheduleNotify(immediate: true);
       throw Exception(lastError);
     }
 
@@ -173,14 +249,20 @@ class CameraProvider extends ChangeNotifier {
       longitude: currentLongitude,
       distanceCm: currentDistanceCm,
       bearingAngle: currentBearing,
-      heightDelta: currentHeightDelta,
+      heightDelta: currentPitch,
       timestamp: DateTime.now(),
     );
+
+    if (currentAlbum!.images.isEmpty) {
+      _referenceScale = _depthService.currentScale;
+      _referenceBearing = currentBearing;
+      _referencePitch = currentPitch;
+    }
 
     currentAlbum!.images.add(captured);
     await _albumService.saveAlbum(currentAlbum!);
     lastError = null;
-    notifyListeners();
+    _scheduleNotify(immediate: true);
   }
 
   void setTargetDistance(double cm) {
@@ -201,7 +283,7 @@ class CameraProvider extends ChangeNotifier {
       }
       _albumService.saveAlbum(currentAlbum!);
     }
-    notifyListeners();
+    _scheduleNotify(immediate: true);
   }
 
   Future<String> uploadAlbum([Album? album]) async {
@@ -216,7 +298,7 @@ class CameraProvider extends ChangeNotifier {
     isUploading = true;
     uploadProgress = 0.0;
     lastDriveLink = null;
-    notifyListeners();
+    _scheduleNotify(immediate: true);
 
     try {
       final List<File> files = target.images.map((e) => File(e.imagePath)).toList();
@@ -224,16 +306,16 @@ class CameraProvider extends ChangeNotifier {
         files: files,
         onProgress: (double p) {
           uploadProgress = p;
-          notifyListeners();
+          _scheduleNotify();
         },
       );
       _uploadedAlbumIds.add(target.id);
       lastDriveLink = link;
-      notifyListeners();
+      _scheduleNotify(immediate: true);
       return link;
     } finally {
       isUploading = false;
-      notifyListeners();
+      _scheduleNotify(immediate: true);
     }
   }
 
@@ -244,11 +326,11 @@ class CameraProvider extends ChangeNotifier {
     if (currentAlbum?.id == id) {
       resetToInitial();
     }
-    notifyListeners();
+    _scheduleNotify(immediate: true);
   }
 
   void resetPosition() {
-    _spatialService.resetPosition();
+    _depthService.clearAnchor();
     _recomputeSpatialValues();
   }
 
@@ -256,15 +338,22 @@ class CameraProvider extends ChangeNotifier {
     currentAlbum = null;
     appState = AppState.initial;
     currentDistanceCm = 0.0;
-    currentHeightDelta = 0.0;
-    notifyListeners();
+    currentPitch = 0.0;
+    _referenceScale = null;
+    _referenceBearing = null;
+    _referencePitch = null;
+    _depthService.clearAnchor();
+    _scheduleNotify(immediate: true);
   }
 
   @override
   void dispose() {
+    _notifyTimer?.cancel();
     _positionSubscription?.cancel();
     _spatialService.removeListener(_onSpatialChange);
+    _depthService.removeListener(_onDepthChange);
     _spatialService.dispose();
+    _depthService.dispose();
     super.dispose();
   }
 }

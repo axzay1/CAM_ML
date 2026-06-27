@@ -9,28 +9,22 @@ void main() {
       expect(delta, closeTo(10, 0.001));
     });
 
-    test('tolerance check succeeds when all deltas are inside threshold', () {
+    test('bearing tolerance succeeds when inside threshold', () {
       final service = SpatialService();
-      final ok = service.isInPosition(
-        currentDistanceCm: 155,
-        targetDistanceCm: 150,
-        currentBearing: 42,
-        anchorBearing: 40,
-        currentHeightDelta: 8,
-      );
+      final ok = service.withinBearingTolerance(42, 40, tolerance: 3);
       expect(ok, isTrue);
     });
 
-    test('tolerance check fails when any axis is out of threshold', () {
+    test('bearing tolerance fails when outside threshold', () {
       final service = SpatialService();
-      final ok = service.isInPosition(
-        currentDistanceCm: 180,
-        targetDistanceCm: 150,
-        currentBearing: 58,
-        anchorBearing: 40,
-        currentHeightDelta: 25,
-      );
+      final ok = service.withinBearingTolerance(58, 40, tolerance: 3);
       expect(ok, isFalse);
+    });
+
+    test('pitch tolerance works for small pitch drift', () {
+      final service = SpatialService();
+      expect(service.withinPitchTolerance(2.5, 0.0, tolerance: 3.0), isTrue);
+      expect(service.withinPitchTolerance(4.2, 0.0, tolerance: 3.0), isFalse);
     });
   });
 }

@@ -17,40 +17,108 @@ class CameraScreen extends StatefulWidget {
   State<CameraScreen> createState() => _CameraScreenState();
 }
 
-class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderStateMixin {
+class _CameraScreenState extends State<CameraScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   CameraController? _cameraController;
   Future<void>? _cameraInit;
-  late final AnimationController _pinPulse;
+  late final AnimationController _pulse;
+  bool _streamActive = false;
+  bool _streamOpInFlight = false;
 
   @override
   void initState() {
     super.initState();
-    _pinPulse = AnimationController(
+    WidgetsBinding.instance.addObserver(this);
+    _pulse = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1000),
+      duration: const Duration(seconds: 1),
     )..repeat(reverse: true);
     _cameraInit = _initializeCamera();
   }
 
   Future<void> _initializeCamera() async {
-    final List<CameraDescription> cameras = await availableCameras();
+    final cameras = await availableCameras();
     if (cameras.isEmpty) {
       return;
     }
-    _cameraController = CameraController(cameras.first, ResolutionPreset.high, enableAudio: false);
+
+    _cameraController = CameraController(
+      cameras.first,
+      ResolutionPreset.medium,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.nv21,
+    );
     await _cameraController!.initialize();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final CameraController? controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      unawaited(_setImageStreamActive(false));
+      return;
+    }
+
+    if (state == AppLifecycleState.resumed) {
+      final bool shouldStream = context.read<CameraProvider>().appState == AppState.capture;
+      unawaited(_setImageStreamActive(shouldStream));
+    }
+  }
+
+  Future<void> _setImageStreamActive(bool shouldBeActive) async {
+    final CameraController? controller = _cameraController;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (_streamOpInFlight) {
+      return;
+    }
+    if (_streamActive == shouldBeActive) {
+      return;
+    }
+
+    _streamOpInFlight = true;
+    try {
+      if (shouldBeActive) {
+        await controller.startImageStream(_onCameraImage);
+      } else if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
+      _streamActive = shouldBeActive;
+    } finally {
+      _streamOpInFlight = false;
+    }
+  }
+
+  void _onCameraImage(CameraImage image) {
+    final CameraController? controller = _cameraController;
+    if (controller == null || !mounted) {
+      return;
+    }
+    context.read<CameraProvider>().processCameraFrame(
+      image,
+      controller.description.sensorOrientation,
+    );
+  }
+
+  @override
   void dispose() {
-    _pinPulse.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    _pulse.dispose();
+    if (_cameraController?.value.isStreamingImages ?? false) {
+      unawaited(_setImageStreamActive(false));
+    }
     _cameraController?.dispose();
     super.dispose();
   }
 
   Color _distanceColor(CameraProvider provider) {
-    final double delta = (provider.currentDistanceCm - provider.targetDistanceCm).abs();
-    if (delta <= 15) {
+    final delta = (provider.currentDistanceCm - provider.targetDistanceCm).abs();
+    if (delta <= 10) {
       return const Color(0xFF4CAF50);
     }
     if (delta <= 30) {
@@ -59,66 +127,46 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
     return const Color(0xFFE53935);
   }
 
-  Future<void> _runCalibrationDialog(CameraProvider provider) async {
+  Future<void> _setPoint(CameraProvider provider) async {
+    final ok = await provider.setPoint(
+      provider.currentLatitude,
+      provider.currentLongitude,
+      provider.currentBearing,
+    );
     if (!mounted) {
       return;
     }
-
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) {
-        return AlertDialog(
-          backgroundColor: Colors.transparent,
-          contentPadding: EdgeInsets.zero,
-          content: GlassContainer(
-            padding: const EdgeInsets.all(16),
-            child: SizedBox(
-              width: 280,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.sensors, color: Colors.white, size: 38),
-                  const SizedBox(height: 10),
-                  const Text(
-                    'Calibrating sensors...',
-                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 17),
-                  ),
-                  const SizedBox(height: 6),
-                  const Text(
-                    'Hold the phone still for 2 seconds',
-                    style: TextStyle(color: Colors.white70, fontSize: 12),
-                  ),
-                  const SizedBox(height: 12),
-                  TweenAnimationBuilder<double>(
-                    tween: Tween(begin: 0, end: 1),
-                    duration: const Duration(seconds: 2),
-                    builder: (context, value, _) {
-                      return LinearProgressIndicator(
-                        value: value,
-                        minHeight: 6,
-                        backgroundColor: Colors.white24,
-                        valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00BCD4)),
-                      );
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
-    );
-
-    await provider.setPoint(provider.currentLatitude, provider.currentLongitude, provider.currentBearing);
-    if (mounted) {
-      Navigator.of(context).pop();
+    if (!ok) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(provider.lastError ?? 'Set point failed')));
     }
   }
 
-  Future<void> _openTargetDistanceDialog(BuildContext context, CameraProvider provider) async {
-    double tempValue = provider.targetDistanceCm;
+  Future<void> _capturePhoto(CameraProvider provider) async {
+    if (_cameraController == null) {
+      return;
+    }
 
+    try {
+      await _setImageStreamActive(false);
+
+      await provider.captureImage(_cameraController!);
+
+      if (mounted) {
+        await _setImageStreamActive(provider.appState == AppState.capture);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+      if (mounted) {
+        await _setImageStreamActive(provider.appState == AppState.capture);
+      }
+    }
+  }
+
+  Future<void> _openTargetDistanceDialog(CameraProvider provider) async {
+    double temp = provider.targetDistanceCm;
     await showDialog<void>(
       context: context,
       builder: (dialogContext) {
@@ -126,30 +174,25 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
           backgroundColor: Colors.transparent,
           contentPadding: EdgeInsets.zero,
           content: StatefulBuilder(
-            builder: (context, setDialogState) {
+            builder: (context, setStateDialog) {
               return GlassContainer(
                 padding: const EdgeInsets.all(16),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Text('Set Target Distance', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 16),
-                    Text('${tempValue.toStringAsFixed(0)} cm', style: const TextStyle(color: Colors.white, fontSize: 16)),
+                    const Text('Set Target Distance', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 18)),
+                    const SizedBox(height: 12),
+                    Text('${temp.toStringAsFixed(0)} cm', style: const TextStyle(color: Colors.white)),
                     Slider(
                       min: 50,
                       max: 500,
+                      value: temp,
                       divisions: 90,
-                      value: tempValue,
-                      onChanged: (value) {
-                        setDialogState(() {
-                          tempValue = value;
-                        });
-                      },
+                      onChanged: (v) => setStateDialog(() => temp = v),
                     ),
-                    const SizedBox(height: 8),
                     FilledButton(
                       onPressed: () {
-                        provider.setTargetDistance(tempValue);
+                        provider.setTargetDistance(temp);
                         Navigator.pop(dialogContext);
                       },
                       child: const Text('Confirm'),
@@ -164,7 +207,7 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
     );
   }
 
-  Future<void> _openCaptureDeckDialog(BuildContext context, CameraProvider provider) async {
+  Future<void> _openCaptureDeckDialog(CameraProvider provider) async {
     final album = provider.currentAlbum;
     if (album == null) {
       return;
@@ -193,13 +236,10 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
                       crossAxisSpacing: 8,
                     ),
                     itemCount: album.images.length,
-                    itemBuilder: (context, index) {
+                    itemBuilder: (_, index) {
                       return ClipRRect(
                         borderRadius: BorderRadius.circular(10),
-                        child: Image.file(
-                          File(album.images[index].imagePath),
-                          fit: BoxFit.cover,
-                        ),
+                        child: Image.file(File(album.images[index].imagePath), fit: BoxFit.cover),
                       );
                     },
                   ),
@@ -208,10 +248,7 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
                 Row(
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(dialogContext),
-                      child: const Text('Cancel'),
-                    ),
+                    TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
                     const SizedBox(width: 8),
                     FilledButton(
                       onPressed: album.isComplete
@@ -219,12 +256,12 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
                               Navigator.pop(dialogContext);
                               try {
                                 final link = await provider.uploadAlbum();
-                                if (!context.mounted) {
+                                if (!mounted) {
                                   return;
                                 }
                                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Uploaded: $link')));
                               } catch (e) {
-                                if (!context.mounted) {
+                                if (!mounted) {
                                   return;
                                 }
                                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
@@ -247,11 +284,20 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
   Widget build(BuildContext context) {
     return Consumer<CameraProvider>(
       builder: (context, provider, _) {
+        final bool capture = provider.appState == AppState.capture;
+        final bool firstPhotoPending = capture && !provider.showAngleHeightGuides;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) {
+            return;
+          }
+          unawaited(_setImageStreamActive(capture));
+        });
+
         return Scaffold(
           backgroundColor: Colors.black,
           body: FutureBuilder<void>(
             future: _cameraInit,
-            builder: (context, snapshot) {
+            builder: (context, _) {
               return Stack(
                 children: [
                   Positioned.fill(
@@ -259,77 +305,89 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
                         ? CameraPreview(_cameraController!)
                         : const Center(child: CircularProgressIndicator()),
                   ),
+                  Center(
+                    child: _Crosshair(
+                      pulse: provider.appState == AppState.initial ? _pulse.value : 1.0,
+                      locked: capture,
+                      inTolerance: provider.isInPosition,
+                      label: provider.appState == AppState.initial
+                          ? 'Point at object and Set Point'
+                          : 'Step back to ${provider.targetDistanceCm.toStringAsFixed(0)}cm',
+                    ),
+                  ),
                   SafeArea(
                     child: Padding(
                       padding: const EdgeInsets.all(12),
                       child: Column(
                         children: [
-                          StreamBuilder<int>(
-                            stream: Stream<int>.periodic(const Duration(milliseconds: 500), (count) => count),
-                            builder: (context, _) {
-                              final Color distanceColor = _distanceColor(provider);
-                              return GlassContainer(
-                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                          GlassContainer(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
                                   children: [
-                                    Row(
-                                      children: [
-                                        Expanded(
-                                          child: Text(
-                                            'GPS ${provider.currentLatitude.toStringAsFixed(5)}, ${provider.currentLongitude.toStringAsFixed(5)}',
-                                            style: const TextStyle(color: Colors.white, fontSize: 11),
-                                            overflow: TextOverflow.ellipsis,
-                                          ),
-                                        ),
-                                        const SizedBox(width: 8),
-                                        Text(
-                                          '📍 ${provider.currentDistanceCm.toStringAsFixed(0)}cm',
-                                          style: TextStyle(color: distanceColor, fontSize: 12, fontWeight: FontWeight.w700),
-                                        ),
-                                        const SizedBox(width: 8),
-                                        Text('Bearing: ${provider.currentBearing.toStringAsFixed(0)}°', style: const TextStyle(color: Colors.white, fontSize: 11)),
-                                        const SizedBox(width: 8),
-                                        Text('Height: ${provider.currentHeightDelta >= 0 ? '+' : ''}${provider.currentHeightDelta.toStringAsFixed(0)}cm', style: const TextStyle(color: Colors.white, fontSize: 11)),
-                                      ],
-                                    ),
-                                    const SizedBox(height: 4),
-                                    const Text(
-                                      'IMU',
-                                      style: TextStyle(color: Color(0xFF00BCD4), fontSize: 10, fontWeight: FontWeight.w700),
-                                    ),
-                                    if (provider.shouldShowDriftWarning)
-                                      const Padding(
-                                        padding: EdgeInsets.only(top: 2),
-                                        child: Text(
-                                          '⚠ Re-set point recommended',
-                                          style: TextStyle(color: Colors.amber, fontSize: 10, fontWeight: FontWeight.w700),
-                                        ),
+                                    Expanded(
+                                      child: Text(
+                                        'GPS ${provider.currentLatitude.toStringAsFixed(5)}, ${provider.currentLongitude.toStringAsFixed(5)}',
+                                        style: const TextStyle(color: Colors.white, fontSize: 11),
+                                        overflow: TextOverflow.ellipsis,
                                       ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      'raw accel: ${provider.rawAcceleration.x.toStringAsFixed(2)}, '
-                                      '${provider.rawAcceleration.y.toStringAsFixed(2)}, '
-                                      '${provider.rawAcceleration.z.toStringAsFixed(2)}',
-                                      style: const TextStyle(color: Colors.white, fontSize: 10),
                                     ),
+                                    const SizedBox(width: 8),
                                     Text(
-                                      'gated: ${provider.gatedAcceleration.length.toStringAsFixed(2)}  '
-                                      'velocity: ${provider.velocityMagnitude.toStringAsFixed(2)}  '
-                                      'still count: ${provider.stillCount}  '
-                                      'calib: ${provider.calibrationCount}',
-                                      style: const TextStyle(color: Colors.white, fontSize: 10),
+                                      provider.hasAnchor
+                                          ? '📍 ${provider.currentDistanceCm.toStringAsFixed(0)}cm'
+                                          : '📍 --',
+                                      style: TextStyle(
+                                        color: _distanceColor(provider),
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w700,
+                                      ),
                                     ),
+                                    const SizedBox(width: 8),
+                                    Text('IMU', style: TextStyle(color: const Color(0xFF00BCD4).withValues(alpha: 0.95), fontSize: 10)),
                                   ],
                                 ),
-                              );
-                            },
+                                if (capture) ...[
+                                  const SizedBox(height: 6),
+                                  _ScaleBar(
+                                    value: provider.scaleBarNormalized,
+                                    inTolerance: (provider.currentDistanceCm - provider.targetDistanceCm).abs() <= 10,
+                                  ),
+                                ],
+                                if (provider.trackingWarning != null) ...[
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    provider.trackingWarning!,
+                                    style: const TextStyle(color: Colors.amber, fontSize: 10, fontWeight: FontWeight.w600),
+                                  ),
+                                ],
+                                if (provider.isUsingFallbackTracking) ...[
+                                  const SizedBox(height: 2),
+                                  const Text(
+                                    'Using fallback tracking',
+                                    style: TextStyle(color: Color(0xFF80DEEA), fontSize: 10),
+                                  ),
+                                ],
+                                if (provider.showAngleHeightGuides) ...[
+                                  const SizedBox(height: 6),
+                                  Row(
+                                    children: [
+                                      Text('Bearing: ${provider.currentBearing.toStringAsFixed(0)}°', style: const TextStyle(color: Colors.white, fontSize: 11)),
+                                      const SizedBox(width: 12),
+                                      Text('Pitch: ${provider.currentPitch.toStringAsFixed(1)}°', style: const TextStyle(color: Colors.white, fontSize: 11)),
+                                    ],
+                                  ),
+                                ],
+                              ],
+                            ),
                           ),
                           const Spacer(),
-                          if (provider.appState == AppState.initial)
+                          if (!capture)
                             _buildInitialBar(provider)
                           else
-                            _buildCaptureBar(provider),
+                            _buildCaptureBar(provider, firstPhotoPending),
                         ],
                       ),
                     ),
@@ -350,24 +408,26 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           IconButton.filledTonal(
-            onPressed: () => _openTargetDistanceDialog(context, provider),
+            onPressed: () => _openTargetDistanceDialog(provider),
             icon: const Icon(Icons.straighten, color: Colors.white),
           ),
-          ScaleTransition(
-            scale: Tween<double>(begin: 0.92, end: 1.08).animate(CurvedAnimation(parent: _pinPulse, curve: Curves.easeInOut)),
-            child: GestureDetector(
-              onTap: () async {
-                await _runCalibrationDialog(provider);
-              },
-              child: Container(
-                width: 72,
-                height: 72,
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Color(0xFF00BCD4),
-                ),
-                child: const Icon(Icons.place, color: Colors.white, size: 34),
+          GestureDetector(
+            onTap: () => _setPoint(provider),
+            child: Container(
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF00BCD4),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF00BCD4).withValues(alpha: 0.55 * _pulse.value),
+                    blurRadius: 18,
+                    spreadRadius: 2,
+                  ),
+                ],
               ),
+              child: const Icon(Icons.place, color: Colors.white, size: 34),
             ),
           ),
           IconButton.filledTonal(
@@ -379,108 +439,197 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
     );
   }
 
-  Widget _buildCaptureBar(CameraProvider provider) {
+  Widget _buildCaptureBar(CameraProvider provider, bool firstPhotoPending) {
     final album = provider.currentAlbum;
     final images = album?.images ?? const [];
 
-    return Stack(
-      children: [
-        GlassContainer(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              GestureDetector(
-                onTap: () => _openCaptureDeckDialog(context, provider),
-                child: SizedBox(
-                  width: 68,
-                  height: 68,
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      for (int i = 0; i < (images.length > 3 ? 3 : images.length); i++)
-                        Positioned(
-                          left: i * 8,
-                          top: i * 6,
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(8),
-                            child: Image.file(
-                              File(images[i].imagePath),
-                              width: 44,
-                              height: 44,
-                              fit: BoxFit.cover,
-                            ),
-                          ),
-                        ),
-                      if (images.isEmpty)
-                        Container(
-                          width: 52,
-                          height: 52,
-                          decoration: BoxDecoration(
-                            color: Colors.white24,
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: const Icon(Icons.photo_size_select_actual_outlined, color: Colors.white70),
-                        ),
-                    ],
-                  ),
-                ),
+    return GlassContainer(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          GestureDetector(
+            onTap: () => _openCaptureDeckDialog(provider),
+            child: SizedBox(
+              width: 68,
+              height: 68,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  for (int i = 0; i < (images.length > 3 ? 3 : images.length); i++)
+                    Positioned(
+                      left: i * 8,
+                      top: i * 6,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.file(File(images[i].imagePath), width: 44, height: 44, fit: BoxFit.cover),
+                      ),
+                    ),
+                  if (images.isEmpty)
+                    Container(
+                      width: 52,
+                      height: 52,
+                      decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(10)),
+                      child: const Icon(Icons.photo_size_select_actual_outlined, color: Colors.white70),
+                    ),
+                ],
               ),
-              SizedBox(
-                width: 72,
-                height: 72,
-                child: ElevatedButton(
-                  onPressed: (!provider.isInPosition || _cameraController == null)
-                      ? null
-                      : () async {
-                          try {
-                            await provider.captureImage(_cameraController!);
-                          } catch (e) {
-                            if (!mounted) {
-                              return;
-                            }
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
-                          }
-                        },
-                  style: ElevatedButton.styleFrom(
-                    shape: const CircleBorder(),
-                    backgroundColor: provider.isInPosition ? const Color(0xFF4CAF50) : Colors.grey,
-                    disabledBackgroundColor: Colors.grey,
-                    padding: EdgeInsets.zero,
-                  ),
-                  child: Icon(
-                    provider.isInPosition ? Icons.check : Icons.close,
-                    size: 32,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-              GuideArrow3D(
-                bearingDelta: provider.bearingDelta,
-                distanceDelta: provider.distanceDelta,
-                heightDelta: provider.currentHeightDelta,
-                targetDistanceCm: provider.targetDistanceCm,
-              ),
-            ],
-          ),
-        ),
-        Positioned(
-          top: 6,
-          left: 6,
-          child: TextButton.icon(
-            onPressed: provider.resetPosition,
-            style: TextButton.styleFrom(
-              backgroundColor: Colors.black.withValues(alpha: 0.35),
-              foregroundColor: Colors.white,
-              visualDensity: VisualDensity.compact,
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             ),
-            icon: const Icon(Icons.restart_alt, size: 14),
-            label: const Text('Reset Position', style: TextStyle(fontSize: 11)),
           ),
+          SizedBox(
+            width: 72,
+            height: 72,
+            child: ElevatedButton(
+              onPressed: (!provider.isInPosition || _cameraController == null) ? null : () => _capturePhoto(provider),
+              style: ElevatedButton.styleFrom(
+                shape: const CircleBorder(),
+                backgroundColor: provider.isInPosition ? const Color(0xFF4CAF50) : const Color(0xFFE53935),
+                disabledBackgroundColor: Colors.grey,
+                padding: EdgeInsets.zero,
+              ),
+              child: Icon(provider.isInPosition ? Icons.check : Icons.close, size: 32, color: Colors.white),
+            ),
+          ),
+          if (!firstPhotoPending)
+            GuideArrow3D(
+              bearingDelta: provider.bearingDelta,
+              distanceDelta: provider.scaleDeltaPercent,
+              heightDelta: provider.pitchDelta,
+              targetDistanceCm: 100.0,
+            )
+          else
+            const SizedBox(width: 132, height: 132),
+        ],
+      ),
+    );
+  }
+}
+
+class _ScaleBar extends StatelessWidget {
+  const _ScaleBar({required this.value, required this.inTolerance});
+
+  final double value;
+  final bool inTolerance;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 24,
+      child: CustomPaint(
+        painter: _ScaleBarPainter(value: value, inTolerance: inTolerance),
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+}
+
+class _ScaleBarPainter extends CustomPainter {
+  _ScaleBarPainter({required this.value, required this.inTolerance});
+
+  final double value;
+  final bool inTolerance;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final line = Paint()
+      ..color = inTolerance ? const Color(0xFF4CAF50) : Colors.white
+      ..strokeWidth = 2;
+
+    final centerX = size.width / 2;
+    final y = size.height / 2;
+
+    canvas.drawLine(Offset(10, y), Offset(size.width - 10, y), line);
+    canvas.drawLine(Offset(centerX, y - 6), Offset(centerX, y + 6), line);
+
+    final markerX = 10 + (size.width - 20) * value;
+    final markerPaint = Paint()..color = const Color(0xFF00BCD4);
+    canvas.drawCircle(Offset(markerX, y), 4, markerPaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ScaleBarPainter oldDelegate) {
+    return oldDelegate.value != value || oldDelegate.inTolerance != inTolerance;
+  }
+}
+
+class _Crosshair extends StatelessWidget {
+  const _Crosshair({
+    required this.pulse,
+    required this.locked,
+    required this.inTolerance,
+    required this.label,
+  });
+
+  final double pulse;
+  final bool locked;
+  final bool inTolerance;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color = inTolerance ? const Color(0xFF4CAF50) : Colors.white;
+    final double opacity = locked ? 1.0 : (0.5 + pulse * 0.5);
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Stack(
+          clipBehavior: Clip.none,
+          children: [
+            CustomPaint(
+              size: const Size(120, 120),
+              painter: _CrosshairPainter(color: color.withValues(alpha: opacity), glow: inTolerance),
+            ),
+            if (locked)
+              const Positioned(
+                top: -8,
+                left: 50,
+                child: Icon(Icons.lock, color: Colors.white, size: 18),
+              ),
+          ],
         ),
+        const SizedBox(height: 10),
+        Text(label, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
       ],
     );
+  }
+}
+
+class _CrosshairPainter extends CustomPainter {
+  _CrosshairPainter({required this.color, required this.glow});
+
+  final Color color;
+  final bool glow;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+
+    final circle = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..color = color;
+
+    if (glow) {
+      circle.maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
+    }
+
+    canvas.drawCircle(center, 30, circle);
+    canvas.drawCircle(center, 3, Paint()..color = color);
+
+    final line = Paint()
+      ..strokeWidth = 1.5
+      ..color = color;
+
+    canvas.drawLine(Offset(center.dx, center.dy - 50), Offset(center.dx, center.dy - 30), line);
+    canvas.drawLine(Offset(center.dx, center.dy + 30), Offset(center.dx, center.dy + 50), line);
+    canvas.drawLine(Offset(center.dx - 50, center.dy), Offset(center.dx - 30, center.dy), line);
+    canvas.drawLine(Offset(center.dx + 30, center.dy), Offset(center.dx + 50, center.dy), line);
+  }
+
+  @override
+  bool shouldRepaint(covariant _CrosshairPainter oldDelegate) {
+    return oldDelegate.color != color || oldDelegate.glow != glow;
   }
 }

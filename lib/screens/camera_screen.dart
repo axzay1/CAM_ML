@@ -306,6 +306,20 @@ class _CameraScreenState extends State<CameraScreen> with SingleTickerProviderSt
                                           style: TextStyle(color: Colors.amber, fontSize: 10, fontWeight: FontWeight.w700),
                                         ),
                                       ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      'raw accel: ${provider.rawAcceleration.x.toStringAsFixed(2)}, '
+                                      '${provider.rawAcceleration.y.toStringAsFixed(2)}, '
+                                      '${provider.rawAcceleration.z.toStringAsFixed(2)}',
+                                      style: const TextStyle(color: Colors.white, fontSize: 10),
+                                    ),
+                                    Text(
+                                      'gated: ${provider.gatedAcceleration.length.toStringAsFixed(2)}  '
+                                      'velocity: ${provider.velocityMagnitude.toStringAsFixed(2)}  '
+                                      'still count: ${provider.stillCount}  '
+                                      'calib: ${provider.calibrationCount}',
+                                      style: const TextStyle(color: Colors.white, fontSize: 10),
+                                    ),
                                   ],
                                 ),
                               );

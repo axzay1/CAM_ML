@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:vector_math/vector_math_64.dart' as vm;
 
 import '../models/album.dart';
 import '../models/captured_image.dart';
@@ -70,6 +71,16 @@ class CameraProvider extends ChangeNotifier {
   bool get isCalibrating => _spatialService.isCalibrating;
 
   bool get shouldShowDriftWarning => appState == AppState.capture && _spatialService.shouldRecommendReset;
+
+  vm.Vector3 get rawAcceleration => _spatialService.rawAcceleration;
+
+  vm.Vector3 get gatedAcceleration => _spatialService.gatedAcceleration;
+
+  double get velocityMagnitude => _spatialService.velocityMagnitude;
+
+  int get stillCount => _spatialService.stillCount;
+
+  int get calibrationCount => _spatialService.calibrationCount;
 
   bool isAlbumUploaded(String albumId) => _uploadedAlbumIds.contains(albumId);
 

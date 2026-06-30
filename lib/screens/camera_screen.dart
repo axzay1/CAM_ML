@@ -5,6 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../models/plot_point.dart';
 import '../providers/camera_provider.dart';
 import '../widgets/glass_container.dart';
 import '../widgets/guide_arrow_3d.dart';
@@ -26,6 +27,14 @@ class _CameraScreenState extends State<CameraScreen>
   bool _streamActive = false;
   bool _streamOpInFlight = false;
 
+  // Auto-capture
+  CameraProvider? _provider;
+  bool _autoCapturing = false;
+  Timer? _autoCaptureTimer;
+
+  // Frame throttle: process 1 in every 3 frames to reduce CPU/heat
+  int _frameSkipCount = 0;
+
   @override
   void initState() {
     super.initState();
@@ -35,13 +44,24 @@ class _CameraScreenState extends State<CameraScreen>
       duration: const Duration(seconds: 1),
     )..repeat(reverse: true);
     _cameraInit = _initializeCamera();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _provider = context.read<CameraProvider>();
+      _provider!.addListener(_checkAutoCapture);
+    });
   }
 
   Future<void> _initializeCamera() async {
+    // Dispose any existing controller before creating a new one.
+    final oldCtrl = _cameraController;
+    _cameraController = null;
+    _streamActive = false;
+    _streamOpInFlight = false;
+    if (mounted) setState(() {});
+    await oldCtrl?.dispose();
+
     final cameras = await availableCameras();
-    if (cameras.isEmpty) {
-      return;
-    }
+    if (cameras.isEmpty || !mounted) return;
 
     _cameraController = CameraController(
       cameras.first,
@@ -51,25 +71,26 @@ class _CameraScreenState extends State<CameraScreen>
     );
     await _cameraController!.initialize();
     await _setImageStreamActive(true);
-    if (mounted) {
-      setState(() {});
-    }
+    if (mounted) setState(() {});
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final CameraController? controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) {
-      return;
-    }
-
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+    if (state == AppLifecycleState.inactive) {
+      // Brief interruption (notification, call overlay) — pause stream only.
       unawaited(_setImageStreamActive(false));
-      return;
-    }
-
-    if (state == AppLifecycleState.resumed) {
-      unawaited(_setImageStreamActive(true));
+    } else if (state == AppLifecycleState.paused) {
+      // Screen locked or app backgrounded — fully release the camera.
+      final ctrl = _cameraController;
+      _cameraController = null;
+      _streamActive = false;
+      _streamOpInFlight = false;
+      unawaited(ctrl?.dispose());
+      if (mounted) setState(() {});
+    } else if (state == AppLifecycleState.resumed) {
+      // Screen unlocked / app foregrounded — reinitialize from scratch.
+      _cameraInit = _initializeCamera();
+      if (mounted) setState(() {});
     }
   }
 
@@ -99,10 +120,9 @@ class _CameraScreenState extends State<CameraScreen>
   }
 
   void _onCameraImage(CameraImage image) {
+    if (_frameSkipCount++ % 3 != 0) return;
     final CameraController? controller = _cameraController;
-    if (controller == null || !mounted) {
-      return;
-    }
+    if (controller == null || !mounted) return;
     context.read<CameraProvider>().processCameraFrame(
       image,
       controller.description.sensorOrientation,
@@ -111,24 +131,48 @@ class _CameraScreenState extends State<CameraScreen>
 
   @override
   void dispose() {
+    _provider?.removeListener(_checkAutoCapture);
+    _autoCaptureTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _pulse.dispose();
-    if (_cameraController?.value.isStreamingImages ?? false) {
-      unawaited(_setImageStreamActive(false));
-    }
-    _cameraController?.dispose();
+    // Don't call setState-based helpers after dispose — release directly.
+    final ctrl = _cameraController;
+    _cameraController = null;
+    ctrl?.dispose();
     super.dispose();
   }
 
-  Color _distanceColor(CameraProvider provider) {
-    final delta = (provider.currentDistanceCm - provider.targetDistanceCm).abs();
-    if (delta <= 10) {
-      return const Color(0xFF4CAF50);
+  void _checkAutoCapture() {
+    if (!mounted) return;
+    final CameraProvider? p = _provider;
+    if (p == null || p.appState != AppState.capture || _autoCapturing) {
+      _autoCaptureTimer?.cancel();
+      _autoCaptureTimer = null;
+      return;
     }
-    if (delta <= 30) {
-      return Colors.amber;
+    if (p.isInPosition && _cameraController != null) {
+      // Start hold timer only if not already running.
+      _autoCaptureTimer ??= Timer(const Duration(milliseconds: 700), () {
+        _autoCaptureTimer = null;
+        if (!mounted || _autoCapturing) return;
+        final CameraProvider? p2 = _provider;
+        if (p2 == null || !p2.isInPosition || p2.appState != AppState.capture) return;
+        _autoCapturing = true;
+        _capturePhoto(p2).whenComplete(() {
+          if (mounted) _autoCapturing = false;
+        });
+      });
+    } else {
+      _autoCaptureTimer?.cancel();
+      _autoCaptureTimer = null;
     }
-    return const Color(0xFFE53935);
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  /// Signed angle difference: positive = turn right, negative = turn left.
+  double _signedAngleDiff(double current, double target) {
+    return (current - target + 540) % 360 - 180;
   }
 
   Future<void> _capturePhoto(CameraProvider provider) async {
@@ -170,11 +214,9 @@ class _CameraScreenState extends State<CameraScreen>
       _showWaitingOverlayState(false);
     }
 
-    final bool success = await provider.setDepthPoint();
+    final bool success = await provider.setPoint();
     if (!success) {
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: const Text('Camera not ready. Try again.'),
@@ -182,63 +224,12 @@ class _CameraScreenState extends State<CameraScreen>
           backgroundColor: Colors.red.withValues(alpha: 0.8),
         ),
       );
-      return;
     }
-
-    await provider.switchToCaptureState(
-      provider.currentLatitude,
-      provider.currentLongitude,
-      provider.currentBearing,
-    );
   }
 
-  Future<void> _openTargetDistanceDialog(CameraProvider provider) async {
-    double temp = provider.targetDistanceCm;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: Colors.transparent,
-          contentPadding: EdgeInsets.zero,
-          content: StatefulBuilder(
-            builder: (context, setStateDialog) {
-              return GlassContainer(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text('Set Target Distance', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700, fontSize: 18)),
-                    const SizedBox(height: 12),
-                    Text('${temp.toStringAsFixed(0)} cm', style: const TextStyle(color: Colors.white)),
-                    Slider(
-                      min: 50,
-                      max: 500,
-                      value: temp,
-                      divisions: 90,
-                      onChanged: (v) => setStateDialog(() => temp = v),
-                    ),
-                    FilledButton(
-                      onPressed: () {
-                        provider.setTargetDistance(temp);
-                        Navigator.pop(dialogContext);
-                      },
-                      child: const Text('Confirm'),
-                    ),
-                  ],
-                ),
-              );
-            },
-          ),
-        );
-      },
-    );
-  }
-
-  Future<void> _openCaptureDeckDialog(CameraProvider provider) async {
+  Future<void> _openCapturedImagesDialog(CameraProvider provider) async {
     final album = provider.currentAlbum;
-    if (album == null) {
-      return;
-    }
+    if (album == null) return;
 
     await showDialog<void>(
       context: context,
@@ -251,13 +242,20 @@ class _CameraScreenState extends State<CameraScreen>
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Text('Captured Images', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
+                const Text(
+                  'Captured Images',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
                 const SizedBox(height: 10),
                 SizedBox(
                   height: 240,
                   width: 280,
                   child: GridView.builder(
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
                       crossAxisCount: 2,
                       mainAxisSpacing: 8,
                       crossAxisSpacing: 8,
@@ -266,7 +264,10 @@ class _CameraScreenState extends State<CameraScreen>
                     itemBuilder: (_, index) {
                       return ClipRRect(
                         borderRadius: BorderRadius.circular(10),
-                        child: Image.file(File(album.images[index].imagePath), fit: BoxFit.cover),
+                        child: Image.file(
+                          File(album.images[index].imagePath),
+                          fit: BoxFit.cover,
+                        ),
                       );
                     },
                   ),
@@ -275,7 +276,10 @@ class _CameraScreenState extends State<CameraScreen>
                 Row(
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
-                    TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Close'),
+                    ),
                     const SizedBox(width: 8),
                     FilledButton(
                       onPressed: album.isComplete
@@ -283,15 +287,15 @@ class _CameraScreenState extends State<CameraScreen>
                               Navigator.pop(dialogContext);
                               try {
                                 final link = await provider.uploadAlbum();
-                                if (!mounted) {
-                                  return;
-                                }
-                                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Uploaded: $link')));
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text('Uploaded: $link')),
+                                );
                               } catch (e) {
-                                if (!mounted) {
-                                  return;
-                                }
-                                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text(e.toString())),
+                                );
                               }
                             }
                           : null,
@@ -307,12 +311,40 @@ class _CameraScreenState extends State<CameraScreen>
     );
   }
 
+  // ── Camera layer ──────────────────────────────────────────────────────────
+
+  Widget _buildCameraLayer() {
+    final ctrl = _cameraController;
+    if (ctrl == null || !ctrl.value.isInitialized) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final Size? preview = ctrl.value.previewSize;
+    if (preview == null) {
+      return CameraPreview(ctrl);
+    }
+    // previewSize is always reported in landscape (width > height).
+    // Swap to get portrait dimensions, then FittedBox.cover scales to fill.
+    return ClipRect(
+      child: FittedBox(
+        fit: BoxFit.cover,
+        child: SizedBox(
+          width: preview.height,
+          height: preview.width,
+          child: CameraPreview(ctrl),
+        ),
+      ),
+    );
+  }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Consumer<CameraProvider>(
       builder: (context, provider, _) {
-        final bool capture = provider.appState == AppState.capture;
-        final bool firstPhotoPending = capture && !provider.showAngleHeightGuides;
+        final Size screenSize = MediaQuery.of(context).size;
+        final double screenW = screenSize.width;
+        final double screenH = screenSize.height;
 
         return Scaffold(
           backgroundColor: Colors.black,
@@ -321,104 +353,43 @@ class _CameraScreenState extends State<CameraScreen>
             builder: (context, _) {
               return Stack(
                 children: [
+                  // ── Layer 1: Camera preview ──────────────────────────────
                   Positioned.fill(
-                    child: (_cameraController != null && _cameraController!.value.isInitialized)
-                        ? CameraPreview(_cameraController!)
-                        : const Center(child: CircularProgressIndicator()),
+                    child: _buildCameraLayer(),
                   ),
-                  Center(
-                    child: _Crosshair(
-                      pulse: provider.appState == AppState.initial ? _pulse.value : 1.0,
-                      locked: capture,
-                      inTolerance: provider.isInPosition,
-                      label: provider.appState == AppState.initial
-                          ? 'Point at object and Set Point'
-                          : 'Step back to ${provider.targetDistanceCm.toStringAsFixed(0)}cm',
-                    ),
+
+                  // ── Layer 2: Center crosshair ────────────────────────────
+                  AnimatedBuilder(
+                    animation: _pulse,
+                    builder: (context, _) =>
+                        _buildCenterCrosshair(provider),
                   ),
-                  SafeArea(
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Column(
-                        children: [
-                          GlassContainer(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: Text(
-                                        'GPS ${provider.currentLatitude.toStringAsFixed(5)}, ${provider.currentLongitude.toStringAsFixed(5)}',
-                                        style: const TextStyle(color: Colors.white, fontSize: 11),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      provider.hasAnchor
-                                          ? '📍 ${provider.currentDistanceCm.toStringAsFixed(0)}cm'
-                                          : '📍 --',
-                                      style: TextStyle(
-                                        color: _distanceColor(provider),
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text('IMU', style: TextStyle(color: const Color(0xFF00BCD4).withValues(alpha: 0.95), fontSize: 10)),
-                                  ],
-                                ),
-                                if (capture) ...[
-                                  const SizedBox(height: 6),
-                                  _ScaleBar(
-                                    value: provider.scaleBarNormalized,
-                                    inTolerance: (provider.currentDistanceCm - provider.targetDistanceCm).abs() <= 10,
-                                  ),
-                                ],
-                                if (provider.trackingWarning != null) ...[
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    provider.trackingWarning!,
-                                    style: const TextStyle(color: Colors.amber, fontSize: 10, fontWeight: FontWeight.w600),
-                                  ),
-                                ],
-                                if (provider.isUsingFallbackTracking) ...[
-                                  const SizedBox(height: 2),
-                                  const Text(
-                                    'Using fallback tracking',
-                                    style: TextStyle(color: Color(0xFF80DEEA), fontSize: 10),
-                                  ),
-                                ],
-                                if (provider.showAngleHeightGuides) ...[
-                                  const SizedBox(height: 6),
-                                  Row(
-                                    children: [
-                                      Text('Bearing: ${provider.currentBearing.toStringAsFixed(0)}°', style: const TextStyle(color: Colors.white, fontSize: 11)),
-                                      const SizedBox(width: 12),
-                                      Text('Pitch: ${provider.currentPitch.toStringAsFixed(1)}°', style: const TextStyle(color: Colors.white, fontSize: 11)),
-                                    ],
-                                  ),
-                                ],
-                              ],
-                            ),
-                          ),
-                          const Spacer(),
-                          if (!capture)
-                            _buildInitialBar(provider)
-                          else
-                            _buildCaptureBar(provider, firstPhotoPending),
-                        ],
+
+                  // ── Layer 3: Floating point crosshairs ───────────────────
+                  if (provider.appState == AppState.capture)
+                    Positioned.fill(
+                      child: Stack(
+                        children: provider.plotPoints
+                            .map((p) => _buildFloatingCrosshair(
+                                provider, p, screenW, screenH))
+                            .toList(),
                       ),
                     ),
-                  ),
+
+                  // ── Layer 4: Top HUD ─────────────────────────────────────
+                  _buildTopHud(provider),
+
+                  // ── Layer 5: Bottom bar ──────────────────────────────────
+                  _buildBottomBar(provider),
+
+                  // ── Waiting overlay ──────────────────────────────────────
                   if (_showWaitingOverlay)
                     Positioned.fill(
                       child: IgnorePointer(
                         child: Center(
                           child: GlassContainer(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 12),
                             child: const Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
@@ -427,13 +398,18 @@ class _CameraScreenState extends State<CameraScreen>
                                   height: 24,
                                   child: CircularProgressIndicator(
                                     strokeWidth: 2.2,
-                                    valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                    valueColor:
+                                        AlwaysStoppedAnimation<Color>(
+                                            Colors.white),
                                   ),
                                 ),
                                 SizedBox(width: 12),
                                 Text(
                                   'Initializing camera...',
-                                  style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
                               ],
                             ),
@@ -450,215 +426,660 @@ class _CameraScreenState extends State<CameraScreen>
     );
   }
 
-  Widget _buildInitialBar(CameraProvider provider) {
-    final bool hasFrame = provider.hasDepthFrame;
-    return GlassContainer(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+  // ── Layer 2: Center crosshair ─────────────────────────────────────────────
+
+  Widget _buildCenterCrosshair(CameraProvider provider) {
+    final AppState state = provider.appState;
+
+    Color color;
+    String label;
+    bool pulsing;
+
+    if (state == AppState.initial) {
+      color = Colors.white;
+      label = 'Point at object → Set Point';
+      pulsing = true;
+    } else if (state == AppState.p1) {
+      color = const Color(0xFF4CAF50);
+      label = 'Shoot P1 freely';
+      pulsing = true;
+    } else {
+      color = provider.isInPosition
+          ? const Color(0xFF4CAF50)
+          : Colors.white;
+      final PlotPoint? active = provider.activePlotPoint;
+      label = active != null ? 'Walk to ${active.label}' : 'Complete!';
+      pulsing = false;
+    }
+
+    final double opacity = pulsing ? (0.5 + _pulse.value * 0.5) : 1.0;
+
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          IconButton.filledTonal(
-            onPressed: () => _openTargetDistanceDialog(provider),
-            icon: const Icon(Icons.straighten, color: Colors.white),
-          ),
-          Tooltip(
-            message: hasFrame ? 'Set Point' : 'Waiting for camera...',
-            child: GestureDetector(
-              onTap: hasFrame ? () => _handleSetPoint(provider) : null,
-              child: Opacity(
-                opacity: hasFrame ? 1.0 : 0.5,
-                child: Container(
-                  width: 72,
-                  height: 72,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: const Color(0xFF00BCD4),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF00BCD4).withValues(alpha: 0.55 * _pulse.value),
-                        blurRadius: 18,
-                        spreadRadius: 2,
-                      ),
-                    ],
-                  ),
-                  child: hasFrame
-                      ? const Icon(Icons.place, color: Colors.white, size: 34)
-                      : const Padding(
-                          padding: EdgeInsets.all(26),
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                          ),
-                        ),
-                ),
-              ),
+          CustomPaint(
+            size: const Size(120, 120),
+            painter: _CrosshairPainter(
+              color: color.withValues(alpha: opacity),
+              glow: state == AppState.capture && provider.isInPosition,
             ),
           ),
-          IconButton.filledTonal(
-            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AlbumScreen())),
-            icon: const Icon(Icons.photo_library_outlined, color: Colors.white),
+          const SizedBox(height: 10),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildCaptureBar(CameraProvider provider, bool firstPhotoPending) {
-    final album = provider.currentAlbum;
-    final images = album?.images ?? const [];
+  // ── Layer 3: Floating crosshairs ──────────────────────────────────────────
+
+  Widget _buildFloatingCrosshair(
+    CameraProvider provider,
+    PlotPoint point,
+    double screenW,
+    double screenH,
+  ) {
+    final double bDelta =
+        _signedAngleDiff(provider.currentBearing, point.requiredBearing);
+    final double pDelta = provider.currentPitch - point.elevationDeg;
+
+    final double screenX =
+        screenW / 2 + (bDelta / 60).clamp(-1.0, 1.0) * screenW * 0.45;
+    final double screenY =
+        screenH / 2 + (pDelta / 40).clamp(-1.0, 1.0) * screenH * 0.3;
+
+    final bool isActive = !point.isCaptured &&
+        point.index == provider.activePlotPoint?.index;
+
+    Widget crosshairWidget;
+    double circleSize;
+
+    if (point.isCaptured) {
+      circleSize = 36;
+      crosshairWidget = Opacity(
+        opacity: 0.6,
+        child: Container(
+          width: circleSize,
+          height: circleSize,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border:
+                Border.all(color: const Color(0xFF4CAF50), width: 2),
+          ),
+          child: const Icon(Icons.check,
+              color: Color(0xFF4CAF50), size: 20),
+        ),
+      );
+    } else if (isActive) {
+      circleSize = 44;
+      crosshairWidget = Container(
+        width: circleSize,
+        height: circleSize,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 2),
+          boxShadow: provider.isInPosition
+              ? [
+                  BoxShadow(
+                    color: const Color(0xFF4CAF50).withValues(alpha: 0.8),
+                    blurRadius: 12,
+                    spreadRadius: 2,
+                  ),
+                ]
+              : null,
+        ),
+        child: const Center(
+          child: Icon(Icons.my_location, color: Colors.white, size: 20),
+        ),
+      );
+    } else {
+      circleSize = 32;
+      crosshairWidget = Opacity(
+        opacity: 0.25,
+        child: Container(
+          width: circleSize,
+          height: circleSize,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 1.5),
+          ),
+        ),
+      );
+    }
+
+    return Positioned(
+      left: screenX - circleSize / 2,
+      top: screenY - circleSize / 2,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          crosshairWidget,
+          const SizedBox(height: 2),
+          Text(
+            point.label,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: isActive ? 11 : 9,
+              fontWeight:
+                  isActive ? FontWeight.w700 : FontWeight.w400,
+            ),
+          ),
+          Text(
+            '${point.azimuthDeg.toInt()}° / ${point.elevationDeg.toInt()}°',
+            style: const TextStyle(color: Colors.white70, fontSize: 8),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Layer 4: Top HUD ──────────────────────────────────────────────────────
+
+  Widget _buildTopHud(CameraProvider provider) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+        child: GlassContainer(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: _buildHudRows(provider),
+          ),
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _buildHudRows(CameraProvider provider) {
+    const TextStyle baseStyle =
+        TextStyle(color: Colors.white, fontSize: 11);
+    const TextStyle dimStyle =
+        TextStyle(color: Colors.white54, fontSize: 10);
+
+    if (provider.appState == AppState.initial) {
+      return [
+        Text(
+          '📷 ${provider.pointsPerLayer}pts × '
+          '${provider.numberOfLayers} layers = '
+          '${provider.totalPoints} photos',
+          style: baseStyle,
+        ),
+        const SizedBox(height: 2),
+        const Text('Point at object → Set Point', style: dimStyle),
+      ];
+    }
+
+    final String gps =
+        'GPS ${provider.currentLatitude.toStringAsFixed(5)}, '
+        '${provider.currentLongitude.toStringAsFixed(5)}';
+
+    if (provider.appState == AppState.p1) {
+      return [
+        Text(gps, style: dimStyle, overflow: TextOverflow.ellipsis),
+        const SizedBox(height: 2),
+        Text(
+          '📍 ${provider.currentDistanceCm.toStringAsFixed(0)}cm  '
+          '🧭 ${provider.currentBearing.toStringAsFixed(0)}°  '
+          '↗ ${provider.currentPitch.toStringAsFixed(1)}°',
+          style: baseStyle,
+        ),
+        const SizedBox(height: 2),
+        const Text(
+          'P1 sets sphere radius R — shoot freely',
+          style: TextStyle(
+            color: Colors.amber,
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        if (provider.trackingWarning != null) ...[
+          const SizedBox(height: 2),
+          Text(
+            provider.trackingWarning!,
+            style: const TextStyle(
+              color: Colors.amber,
+              fontSize: 10,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+        if (provider.isUsingFallbackTracking) ...[
+          const SizedBox(height: 2),
+          const Text(
+            'Using fallback tracking',
+            style: TextStyle(color: Color(0xFF80DEEA), fontSize: 10),
+          ),
+        ],
+      ];
+    }
+
+    // capture state
+    final ps = provider.positionStatus;
+    final String distStr = ps == null
+        ? '↕ --'
+        : ps.distanceOK
+            ? '↕ ✅'
+            : '↕ ${ps.distanceDelta.toStringAsFixed(0)}cm';
+    final String bearStr = ps == null
+        ? '🧭 --'
+        : ps.bearingOK
+            ? '🧭 ✅'
+            : '🧭 ${ps.bearingDelta.toStringAsFixed(0)}°';
+    final String pitchStr = ps == null
+        ? '↗ --'
+        : ps.pitchOK
+            ? '↗ ✅'
+            : '↗ ${ps.pitchDelta.toStringAsFixed(1)}°';
+
+    return [
+      Text(gps, style: dimStyle, overflow: TextOverflow.ellipsis),
+      const SizedBox(height: 2),
+      Text(
+        '📍 ${provider.currentDistanceCm.toStringAsFixed(0)}cm  '
+        '🧭 ${provider.currentBearing.toStringAsFixed(0)}°',
+        style: baseStyle,
+      ),
+      const SizedBox(height: 2),
+      Text(
+        'P${provider.capturedCount + 1}/${provider.totalPoints}  |  '
+        'Face: ${provider.activePlotPoint?.requiredBearing.toStringAsFixed(0) ?? '--'}°  |  '
+        'R: ${provider.sphereRadiusCm?.toStringAsFixed(0) ?? '--'}cm',
+        style: baseStyle,
+      ),
+      const SizedBox(height: 2),
+      Text(
+        '$distStr   $bearStr   $pitchStr',
+        style: const TextStyle(
+          color: Colors.white70,
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      if (provider.trackingWarning != null) ...[
+        const SizedBox(height: 2),
+        Text(
+          provider.trackingWarning!,
+          style: const TextStyle(
+            color: Colors.amber,
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+      if (provider.isUsingFallbackTracking) ...[
+        const SizedBox(height: 2),
+        const Text(
+          'Using fallback tracking',
+          style: TextStyle(color: Color(0xFF80DEEA), fontSize: 10),
+        ),
+      ],
+    ];
+  }
+
+  // ── Layer 5: Bottom bar ───────────────────────────────────────────────────
+
+  Widget _buildBottomBar(CameraProvider provider) {
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          child: switch (provider.appState) {
+            AppState.initial => _buildInitialBar(provider),
+            AppState.p1 => _buildP1Bar(provider),
+            AppState.capture => _buildCaptureBar(provider),
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInitialBar(CameraProvider provider) {
+    final bool hasFrame = provider.hasDepthFrame;
+
+    return GlassContainer(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          // Left: pickers
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Points per layer',
+                style: TextStyle(color: Colors.white70, fontSize: 10),
+              ),
+              const SizedBox(height: 4),
+              _buildPills(
+                options: const [4, 8, 12],
+                selected: provider.pointsPerLayer,
+                onTap: provider.setPointsPerLayer,
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Layers',
+                style: TextStyle(color: Colors.white70, fontSize: 10),
+              ),
+              const SizedBox(height: 4),
+              _buildPills(
+                options: const [1, 2, 3, 4],
+                selected: provider.numberOfLayers,
+                onTap: provider.setNumberOfLayers,
+              ),
+            ],
+          ),
+
+          // Center: SET POINT button
+          AnimatedBuilder(
+            animation: _pulse,
+            builder: (context, _) {
+              return GestureDetector(
+                onTap: hasFrame ? () => _handleSetPoint(provider) : null,
+                child: Opacity(
+                  opacity: hasFrame ? 1.0 : 0.5,
+                  child: Container(
+                    width: 72,
+                    height: 72,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: const Color(0xFF00BCD4),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF00BCD4)
+                              .withValues(alpha: 0.55 * _pulse.value),
+                          blurRadius: 18,
+                          spreadRadius: 2,
+                        ),
+                      ],
+                    ),
+                    child: hasFrame
+                        ? const Icon(Icons.place,
+                            color: Colors.white, size: 34)
+                        : const Padding(
+                            padding: EdgeInsets.all(24),
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                  Colors.white),
+                            ),
+                          ),
+                  ),
+                ),
+              );
+            },
+          ),
+
+          // Right: album
+          IconButton.filledTonal(
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const AlbumScreen()),
+            ),
+            icon: const Icon(Icons.photo_library_outlined,
+                color: Colors.white),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildP1Bar(CameraProvider provider) {
+    return GlassContainer(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const Text(
+            'Shoot P1 from any position',
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+              fontSize: 13,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Sets sphere R for all ${provider.totalPoints} photos',
+            style:
+                const TextStyle(color: Colors.white54, fontSize: 10),
+          ),
+          const SizedBox(height: 12),
+          GestureDetector(
+            onTap: _cameraController != null
+                ? () => _capturePhoto(provider)
+                : null,
+            child: Container(
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF4CAF50),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF4CAF50)
+                        .withValues(alpha: 0.6),
+                    blurRadius: 18,
+                    spreadRadius: 3,
+                  ),
+                ],
+              ),
+              child: const Icon(Icons.camera_alt,
+                  color: Colors.white, size: 32),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCaptureBar(CameraProvider provider) {
+    final images = provider.currentAlbum?.images ?? const [];
+    final bool inPos = provider.isInPosition;
+    final int captured = provider.capturedCount;
+    final int total = provider.totalPoints;
+    final bool done = provider.albumComplete;
 
     return GlassContainer(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        crossAxisAlignment: CrossAxisAlignment.end,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
+          // Left: stacked thumbnails
           GestureDetector(
-            onTap: () => _openCaptureDeckDialog(provider),
+            onTap: () => _openCapturedImagesDialog(provider),
             child: SizedBox(
               width: 68,
               height: 68,
               child: Stack(
                 clipBehavior: Clip.none,
                 children: [
-                  for (int i = 0; i < (images.length > 3 ? 3 : images.length); i++)
+                  for (int i = 0;
+                      i < (images.length > 3 ? 3 : images.length);
+                      i++)
                     Positioned(
-                      left: i * 8,
-                      top: i * 6,
+                      left: i * 8.0,
+                      top: i * 6.0,
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8),
-                        child: Image.file(File(images[i].imagePath), width: 44, height: 44, fit: BoxFit.cover),
+                        child: Image.file(
+                          File(images[i].imagePath),
+                          width: 44,
+                          height: 44,
+                          fit: BoxFit.cover,
+                        ),
                       ),
                     ),
                   if (images.isEmpty)
                     Container(
                       width: 52,
                       height: 52,
-                      decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(10)),
-                      child: const Icon(Icons.photo_size_select_actual_outlined, color: Colors.white70),
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(
+                        Icons.photo_size_select_actual_outlined,
+                        color: Colors.white70,
+                      ),
                     ),
                 ],
               ),
             ),
           ),
-          SizedBox(
-            width: 72,
-            height: 72,
-            child: ElevatedButton(
-              onPressed: (!provider.isInPosition || _cameraController == null) ? null : () => _capturePhoto(provider),
-              style: ElevatedButton.styleFrom(
-                shape: const CircleBorder(),
-                backgroundColor: provider.isInPosition ? const Color(0xFF4CAF50) : const Color(0xFFE53935),
-                disabledBackgroundColor: Colors.grey,
-                padding: EdgeInsets.zero,
+
+          // Center: counter + shutter (or Done) + status chips
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                done ? 'All done!' : 'P${captured + 1}/$total',
+                style: TextStyle(
+                  color: done ? const Color(0xFF4CAF50) : Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
-              child: Icon(provider.isInPosition ? Icons.check : Icons.close, size: 32, color: Colors.white),
-            ),
+              const SizedBox(height: 4),
+              SizedBox(
+                width: 72,
+                height: 72,
+                child: done
+                    ? ElevatedButton(
+                        onPressed: () => provider.resetToInitial(),
+                        style: ElevatedButton.styleFrom(
+                          shape: const CircleBorder(),
+                          backgroundColor: const Color(0xFF00BCD4),
+                          padding: EdgeInsets.zero,
+                        ),
+                        child: const Icon(Icons.done_all,
+                            size: 32, color: Colors.white),
+                      )
+                    : ElevatedButton(
+                        onPressed: (inPos && _cameraController != null)
+                            ? () => _capturePhoto(provider)
+                            : null,
+                        style: ElevatedButton.styleFrom(
+                          shape: const CircleBorder(),
+                          backgroundColor: inPos
+                              ? const Color(0xFF4CAF50)
+                              : const Color(0xFFE53935),
+                          disabledBackgroundColor: const Color(0xFFE53935)
+                              .withValues(alpha: 0.5),
+                          padding: EdgeInsets.zero,
+                        ),
+                        child: Icon(
+                          inPos ? Icons.check : Icons.close,
+                          size: 32,
+                          color: Colors.white,
+                        ),
+                      ),
+              ),
+              const SizedBox(height: 5),
+              if (!done) _buildStatusChips(provider),
+            ],
           ),
-          if (!firstPhotoPending)
-            GuideArrow3D(
-              bearingDelta: provider.bearingDelta,
-              distanceDelta: provider.scaleDeltaPercent,
-              heightDelta: provider.pitchDelta,
-              targetDistanceCm: 100.0,
-            )
-          else
-            const SizedBox(width: 132, height: 132),
+
+          // Right: 3D guide arrow
+          GuideArrow3D(
+            bearingDelta: provider.positionStatus?.bearingDelta ?? 0,
+            distanceDelta: provider.positionStatus?.distanceDelta ?? 0,
+            heightDelta: provider.positionStatus?.pitchDelta ?? 0,
+            targetDistanceCm: provider.sphereRadiusCm ?? 150,
+          ),
         ],
       ),
     );
   }
-}
 
-class _ScaleBar extends StatelessWidget {
-  const _ScaleBar({required this.value, required this.inTolerance});
-
-  final double value;
-  final bool inTolerance;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 24,
-      child: CustomPaint(
-        painter: _ScaleBarPainter(value: value, inTolerance: inTolerance),
-        child: const SizedBox.expand(),
-      ),
-    );
-  }
-}
-
-class _ScaleBarPainter extends CustomPainter {
-  _ScaleBarPainter({required this.value, required this.inTolerance});
-
-  final double value;
-  final bool inTolerance;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final line = Paint()
-      ..color = inTolerance ? const Color(0xFF4CAF50) : Colors.white
-      ..strokeWidth = 2;
-
-    final centerX = size.width / 2;
-    final y = size.height / 2;
-
-    canvas.drawLine(Offset(10, y), Offset(size.width - 10, y), line);
-    canvas.drawLine(Offset(centerX, y - 6), Offset(centerX, y + 6), line);
-
-    final markerX = 10 + (size.width - 20) * value;
-    final markerPaint = Paint()..color = const Color(0xFF00BCD4);
-    canvas.drawCircle(Offset(markerX, y), 4, markerPaint);
-  }
-
-  @override
-  bool shouldRepaint(covariant _ScaleBarPainter oldDelegate) {
-    return oldDelegate.value != value || oldDelegate.inTolerance != inTolerance;
-  }
-}
-
-class _Crosshair extends StatelessWidget {
-  const _Crosshair({
-    required this.pulse,
-    required this.locked,
-    required this.inTolerance,
-    required this.label,
-  });
-
-  final double pulse;
-  final bool locked;
-  final bool inTolerance;
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    final Color color = inTolerance ? const Color(0xFF4CAF50) : Colors.white;
-    final double opacity = locked ? 1.0 : (0.5 + pulse * 0.5);
-
-    return Column(
+  Widget _buildStatusChips(CameraProvider provider) {
+    final ps = provider.positionStatus;
+    if (ps == null) return const SizedBox.shrink();
+    return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Stack(
-          clipBehavior: Clip.none,
-          children: [
-            CustomPaint(
-              size: const Size(120, 120),
-              painter: _CrosshairPainter(color: color.withValues(alpha: opacity), glow: inTolerance),
-            ),
-            if (locked)
-              const Positioned(
-                top: -8,
-                left: 50,
-                child: Icon(Icons.lock, color: Colors.white, size: 18),
-              ),
-          ],
-        ),
-        const SizedBox(height: 10),
-        Text(label, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
+        _chip('🧭', ps.bearingOK, '${ps.bearingDelta.toStringAsFixed(0)}°'),
+        const SizedBox(width: 4),
+        _chip('↗', ps.pitchOK, '${ps.pitchDelta.toStringAsFixed(1)}°'),
+        const SizedBox(width: 4),
+        _chip('↕', ps.distanceOK, '${ps.distanceDelta.toStringAsFixed(0)}cm'),
       ],
     );
   }
+
+  Widget _chip(String icon, bool ok, String delta) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        color: ok
+            ? const Color(0xFF4CAF50).withValues(alpha: 0.35)
+            : Colors.red.withValues(alpha: 0.35),
+      ),
+      child: Text(
+        ok ? '$icon ✓' : '$icon $delta',
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 9,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPills({
+    required List<int> options,
+    required int selected,
+    required void Function(int) onTap,
+  }) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: options.map((n) {
+        final bool sel = n == selected;
+        return GestureDetector(
+          onTap: () => onTap(n),
+          child: Container(
+            margin: const EdgeInsets.only(right: 6),
+            padding: const EdgeInsets.symmetric(
+                horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: sel
+                    ? const Color(0xFF00BCD4)
+                    : Colors.white38,
+              ),
+            ),
+            child: Text(
+              '$n',
+              style: TextStyle(
+                color: sel ? const Color(0xFF00BCD4) : Colors.white38,
+                fontSize: 13,
+                fontWeight:
+                    sel ? FontWeight.w700 : FontWeight.w400,
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
 }
+
+// ── Standalone painter ─────────────────────────────────────────────────────
 
 class _CrosshairPainter extends CustomPainter {
   _CrosshairPainter({required this.color, required this.glow});
@@ -668,9 +1089,9 @@ class _CrosshairPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
+    final Offset center = Offset(size.width / 2, size.height / 2);
 
-    final circle = Paint()
+    final Paint circle = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.5
       ..color = color;
@@ -682,18 +1103,22 @@ class _CrosshairPainter extends CustomPainter {
     canvas.drawCircle(center, 30, circle);
     canvas.drawCircle(center, 3, Paint()..color = color);
 
-    final line = Paint()
+    final Paint line = Paint()
       ..strokeWidth = 1.5
       ..color = color;
 
-    canvas.drawLine(Offset(center.dx, center.dy - 50), Offset(center.dx, center.dy - 30), line);
-    canvas.drawLine(Offset(center.dx, center.dy + 30), Offset(center.dx, center.dy + 50), line);
-    canvas.drawLine(Offset(center.dx - 50, center.dy), Offset(center.dx - 30, center.dy), line);
-    canvas.drawLine(Offset(center.dx + 30, center.dy), Offset(center.dx + 50, center.dy), line);
+    canvas.drawLine(Offset(center.dx, center.dy - 50),
+        Offset(center.dx, center.dy - 30), line);
+    canvas.drawLine(Offset(center.dx, center.dy + 30),
+        Offset(center.dx, center.dy + 50), line);
+    canvas.drawLine(Offset(center.dx - 50, center.dy),
+        Offset(center.dx - 30, center.dy), line);
+    canvas.drawLine(Offset(center.dx + 30, center.dy),
+        Offset(center.dx + 50, center.dy), line);
   }
 
   @override
-  bool shouldRepaint(covariant _CrosshairPainter oldDelegate) {
-    return oldDelegate.color != color || oldDelegate.glow != glow;
-  }
+  bool shouldRepaint(covariant _CrosshairPainter oldDelegate) =>
+      oldDelegate.color != color || oldDelegate.glow != glow;
 }
+

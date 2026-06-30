@@ -1,39 +1,71 @@
 import 'captured_image.dart';
+import 'plot_point.dart';
 
 class Album {
+  final String id;
+  final String name;
+  final double anchorLatitude;
+  final double anchorLongitude;
+  final double anchorBearing;
+  final int pointsPerLayer;
+  final int numberOfLayers;
+  int currentPointIndex;
+  List<PlotPoint> plotPoints;
+  List<CapturedImage> images;
+
   Album({
     required this.id,
     required this.name,
-    required this.anchorLat,
-    required this.anchorLng,
+    required this.anchorLatitude,
+    required this.anchorLongitude,
     required this.anchorBearing,
-    required this.targetDistanceCm,
-    required this.images,
-  });
+    required this.pointsPerLayer,
+    required this.numberOfLayers,
+    this.currentPointIndex = 1,
+    List<PlotPoint>? plotPoints,
+    List<CapturedImage>? images,
+  })  : plotPoints = plotPoints ?? [],
+        images = images ?? [];
 
-  final String id;
-  final String name;
-  final double anchorLat;
-  final double anchorLng;
-  final double anchorBearing;
-  final double targetDistanceCm;
-  final List<CapturedImage> images;
+  int get totalPoints => pointsPerLayer * numberOfLayers;
 
-  bool get isComplete => images.length >= 4;
+  PlotPoint? get activePoint =>
+      currentPointIndex < plotPoints.length
+          ? plotPoints[currentPointIndex]
+          : null;
+
+  bool get isComplete =>
+      plotPoints.isNotEmpty && plotPoints.every((p) => p.isCaptured);
+
+  double? get sphereRadiusCm =>
+      plotPoints.isEmpty ? null : plotPoints.first.distanceCm;
 
   Map<String, dynamic> toMap() {
     return {
       'id': id,
       'name': name,
-      'anchorLat': anchorLat,
-      'anchorLng': anchorLng,
+      'anchorLatitude': anchorLatitude,
+      'anchorLongitude': anchorLongitude,
       'anchorBearing': anchorBearing,
-      'targetDistanceCm': targetDistanceCm,
+      'pointsPerLayer': pointsPerLayer,
+      'numberOfLayers': numberOfLayers,
+      'currentPointIndex': currentPointIndex,
+      'plotPoints': plotPoints.map((p) => p.toMap()).toList(),
       'images': images.map((e) => e.toMap()).toList(),
     };
   }
 
   factory Album.fromMap(Map<dynamic, dynamic> map) {
+    final dynamic rawPlotPoints = map['plotPoints'];
+    final List<PlotPoint> plotPointList = <PlotPoint>[];
+    if (rawPlotPoints is List) {
+      for (final dynamic item in rawPlotPoints) {
+        if (item is Map) {
+          plotPointList.add(PlotPoint.fromMap(item));
+        }
+      }
+    }
+
     final dynamic rawImages = map['images'];
     final List<CapturedImage> imageList = <CapturedImage>[];
     if (rawImages is List) {
@@ -47,10 +79,13 @@ class Album {
     return Album(
       id: map['id'] as String,
       name: map['name'] as String,
-      anchorLat: (map['anchorLat'] as num).toDouble(),
-      anchorLng: (map['anchorLng'] as num).toDouble(),
+      anchorLatitude: (map['anchorLatitude'] as num).toDouble(),
+      anchorLongitude: (map['anchorLongitude'] as num).toDouble(),
       anchorBearing: (map['anchorBearing'] as num).toDouble(),
-      targetDistanceCm: (map['targetDistanceCm'] as num).toDouble(),
+      pointsPerLayer: (map['pointsPerLayer'] as num? ?? 4).toInt(),
+      numberOfLayers: (map['numberOfLayers'] as num? ?? 1).toInt(),
+      currentPointIndex: (map['currentPointIndex'] as num? ?? 1).toInt(),
+      plotPoints: plotPointList,
       images: imageList,
     );
   }

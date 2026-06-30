@@ -16,7 +16,6 @@ class DepthService extends ChangeNotifier {
         );
 
   static const Duration _minProcessInterval = Duration(milliseconds: 66);
-  static const Duration _fallbackDelay = Duration(seconds: 1);
   static const int _fallbackPatchSize = 32;
 
   final ObjectDetector _detector;
@@ -42,7 +41,6 @@ class DepthService extends ChangeNotifier {
   bool _isUsingFallback = false;
 
   DateTime? _lastProcessed;
-  DateTime _lastCenterObjectAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   bool get hasFrame => _lastFrame != null;
   bool get hasAnchor => _isCalibrated;
@@ -91,39 +89,56 @@ class DepthService extends ChangeNotifier {
   }
 
   Future<bool> setPoint({required double targetDistanceCm}) async {
-    if (!hasFrame) {
-      return false;
-    }
+    if (!hasFrame) return false;
 
     final CameraImage frame = _lastFrame!;
+    _targetDistanceCm = targetDistanceCm;
 
+    // Try ML Kit first
     final InputImage? inputImage = _convertCameraImage(frame);
-    if (inputImage == null) {
-      _warningMessage = 'Camera format not supported for ML detection.';
-      notifyListeners();
-      return false;
+    if (inputImage != null) {
+      try {
+        final List<DetectedObject> objects = await _detector.processImage(inputImage);
+        final DetectedObject? centerObject = _findCenterObject(objects, frame.width, frame.height);
+
+        if (centerObject != null) {
+          // ML Kit found an object, use bounding box anchor.
+          final Rect box = centerObject.boundingBox;
+          _anchorBoundingBoxArea = box.width * box.height;
+          _anchorFrameArea = (frame.width * frame.height).toDouble();
+          _isUsingFallback = false;
+        } else {
+          // No object detected, use patch anchor directly.
+          _anchorBoundingBoxArea = 0;
+          _anchorFrameArea = 0;
+          _isUsingFallback = true;
+        }
+      } catch (_) {
+        _anchorBoundingBoxArea = 0;
+        _anchorFrameArea = 0;
+        _isUsingFallback = true;
+      }
+    } else {
+      _anchorBoundingBoxArea = 0;
+      _anchorFrameArea = 0;
+      _isUsingFallback = true;
     }
 
-    final List<DetectedObject> objects = await _detector.processImage(inputImage);
-    final DetectedObject? centerObject = _findCenterObject(objects, frame.width, frame.height);
-    if (centerObject == null) {
-      _warningMessage = 'Keep object in crosshair';
-      notifyListeners();
-      return false;
-    }
-
-    final Rect box = centerObject.boundingBox;
-    _anchorBoundingBoxArea = box.width * box.height;
-    _anchorFrameArea = (frame.width * frame.height).toDouble();
+    // Always set the patch anchor regardless of ML Kit result.
     _fallbackAnchorPatch = _extractCenterPatch(frame, _fallbackPatchSize);
 
-    _targetDistanceCm = targetDistanceCm;
+    // If we have neither ML Kit nor patch, fail.
+    if (_anchorBoundingBoxArea == 0 && _fallbackAnchorPatch == null) {
+      _warningMessage = 'Cannot read camera frame';
+      notifyListeners();
+      return false;
+    }
+
+    // Calibration successful.
     _isCalibrated = true;
     _scale = 1.0;
     _currentDistanceCm = targetDistanceCm;
-    _warningMessage = null;
-    _isUsingFallback = false;
-    _lastCenterObjectAt = DateTime.now();
+    _warningMessage = _isUsingFallback ? 'Using feature tracking (no object detected)' : null;
     _lastProcessed = null;
     notifyListeners();
     return true;
@@ -140,7 +155,6 @@ class DepthService extends ChangeNotifier {
     _warningMessage = null;
     _isUsingFallback = false;
     _lastProcessed = null;
-    _lastCenterObjectAt = DateTime.fromMillisecondsSinceEpoch(0);
     notifyListeners();
   }
 
@@ -169,10 +183,8 @@ class DepthService extends ChangeNotifier {
         _currentDistanceCm = _targetDistanceCm / _scale;
         _warningMessage = null;
         _isUsingFallback = false;
-        _lastCenterObjectAt = now;
       } else {
-        final bool shouldFallback = now.difference(_lastCenterObjectAt) > _fallbackDelay;
-        if (shouldFallback && _fallbackAnchorPatch != null) {
+        if (_fallbackAnchorPatch != null) {
           final Uint8List? currentPatch = _extractCenterPatch(frame, _fallbackPatchSize);
           if (currentPatch != null) {
             final double fallbackScale = await compute<Map<String, Uint8List>, double>(

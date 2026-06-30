@@ -1,158 +1,195 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 
 import '../models/album.dart';
 import '../models/captured_image.dart';
+import '../models/plot_point.dart';
 import '../services/album_service.dart';
 import '../services/depth_service.dart';
 import '../services/drive_service.dart';
-import '../services/spatial_service.dart';
+import '../services/location_service.dart';
+import '../services/plot_service.dart';
+import '../services/position_check_service.dart';
 
-enum AppState { initial, capture }
+enum AppState { initial, p1, capture }
 
 class CameraProvider extends ChangeNotifier {
   CameraProvider({
-    SpatialService? spatialService,
+    DepthService? depthService,
     AlbumService? albumService,
     DriveService? driveService,
-    DepthService? depthService,
-  })  : _spatialService = spatialService ?? SpatialService(),
-        _albumService = albumService ?? AlbumService(),
-        _driveService = driveService ?? DriveService(),
-        _depthService = depthService ?? DepthService() {
+    LocationService? locationService,
+  })  : depthService = depthService ?? DepthService(),
+        albumService = albumService ?? AlbumService(),
+        driveService = driveService ?? DriveService(),
+        locationService = locationService ?? LocationService() {
     _initialize();
   }
 
-  final SpatialService _spatialService;
-  final AlbumService _albumService;
-  final DriveService _driveService;
-  final DepthService _depthService;
+  // ── Services ──────────────────────────────────────────────────────────────
+  final DepthService depthService;
+  final LocationService locationService;
+  final AlbumService albumService;
+  final DriveService driveService;
+  final PlotService _plotService = PlotService();
+  final PositionCheckService _positionCheck = PositionCheckService();
 
-  StreamSubscription<Position>? _positionSubscription;
+  // ── Sensor subscriptions ──────────────────────────────────────────────────
+  StreamSubscription<CompassEvent>? _compassSub;
+  StreamSubscription<AccelerometerEvent>? _accelSub;
+  StreamSubscription<Position>? _positionSub;
 
-  AppState appState = AppState.initial;
-  Album? currentAlbum;
+  // ── App state ─────────────────────────────────────────────────────────────
+  AppState _appState = AppState.initial;
+  AppState get appState => _appState;
+
+  // ── User inputs ───────────────────────────────────────────────────────────
+  int _pointsPerLayer = 4;
+  int _numberOfLayers = 1;
+  int get pointsPerLayer => _pointsPerLayer;
+  int get numberOfLayers => _numberOfLayers;
+  int get totalPoints => _pointsPerLayer * _numberOfLayers;
+
+  void setPointsPerLayer(int v) {
+    assert(v == 4 || v == 8 || v == 12);
+    _pointsPerLayer = v;
+    _scheduleNotify();
+  }
+
+  void setNumberOfLayers(int v) {
+    assert(v >= 1 && v <= 4);
+    _numberOfLayers = v;
+    _scheduleNotify();
+  }
+
+  // ── Anchor ────────────────────────────────────────────────────────────────
+  double _anchorLat = 0;
+  double _anchorLng = 0;
+  double _anchorBearing = 0;
+
+  // ── P1 sphere definition (null until P1 is shot) ──────────────────────────
+  double? _p1DistanceCm;
+  double? _p1AzimuthDeg;
+  double? _p1ElevationDeg;
+  double? get sphereRadiusCm => _p1DistanceCm;
+
+  // ── Current album ─────────────────────────────────────────────────────────
+  Album? _currentAlbum;
+  Album? get currentAlbum => _currentAlbum;
+
+  // ── Albums list (for AlbumScreen) ─────────────────────────────────────────
   List<Album> albums = <Album>[];
 
-  double currentDistanceCm = 0.0;
-  double currentBearing = 0.0;
-  double currentPitch = 0.0;
-  double targetDistanceCm = 150.0;
+  // ── Live sensor readings ──────────────────────────────────────────────────
+  double _currentBearing = 0.0;
+  double _currentPitch = 0.0;
+  double _currentLatitude = 0.0;
+  double _currentLongitude = 0.0;
 
-  double currentLatitude = 0.0;
-  double currentLongitude = 0.0;
+  double get currentBearing => _currentBearing;
+  double get currentPitch => _currentPitch;
+  double get currentLatitude => _currentLatitude;
+  double get currentLongitude => _currentLongitude;
 
+  // ── Init flag ─────────────────────────────────────────────────────────────
   bool _initialized = false;
   bool get initialized => _initialized;
 
-  String? lastError;
+  // ── Upload state (used by AlbumScreen) ───────────────────────────────────
   bool isUploading = false;
   double uploadProgress = 0.0;
   String? lastDriveLink;
-
   final Set<String> _uploadedAlbumIds = <String>{};
 
+  // ── UI notify throttle ────────────────────────────────────────────────────
   static const Duration _minUiNotifyInterval = Duration(milliseconds: 66);
   DateTime _lastNotifyAt = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _notifyTimer;
 
-  double? _referenceScale;
-  double? _referenceBearing;
-  double? _referencePitch;
+  // ── Plot points ───────────────────────────────────────────────────────────
+  List<PlotPoint> get plotPoints =>
+      _currentAlbum?.plotPoints ?? <PlotPoint>[];
 
-  bool get isInPosition {
-    if (currentAlbum == null) {
-      return false;
-    }
+  PlotPoint? get activePlotPoint => _currentAlbum?.activePoint;
 
-    if (currentAlbum!.images.isEmpty) {
-      return (currentDistanceCm - targetDistanceCm).abs() <= 10.0;
-    }
+  int get capturedCount => plotPoints.where((p) => p.isCaptured).length;
 
-    if (_referenceScale == null || _referenceBearing == null || _referencePitch == null) {
-      return false;
-    }
+  bool get albumComplete => _currentAlbum?.isComplete ?? false;
 
-    final bool scaleOk = ((_depthService.currentScale - _referenceScale!).abs() / _referenceScale!) <= 0.08;
-    final bool bearingOk = _spatialService.withinBearingTolerance(currentBearing, _referenceBearing!, tolerance: 3.0);
-    final bool pitchOk = _spatialService.withinPitchTolerance(currentPitch, _referencePitch!, tolerance: 3.0);
-    return scaleOk && bearingOk && pitchOk;
-  }
-
-  bool get canUpload => currentAlbum?.isComplete == true;
-
-  bool get hasAnchor => _depthService.hasAnchor;
-
-  bool get hasDepthFrame => _depthService.hasFrame;
-
-  double get currentScale => _depthService.currentScale;
-
-  String? get trackingWarning => _depthService.warningMessage;
-
-  bool get isUsingFallbackTracking => _depthService.isUsingFallback;
-
-  bool get showAngleHeightGuides => currentAlbum != null && currentAlbum!.images.isNotEmpty;
-
-  bool isAlbumUploaded(String albumId) => _uploadedAlbumIds.contains(albumId);
-
-  double get bearingDelta {
-    if (currentAlbum == null) {
-      return 0.0;
-    }
-    return _spatialService.bearingDelta(currentBearing, currentAlbum!.anchorBearing);
-  }
-
-  double get distanceDelta => currentDistanceCm - targetDistanceCm;
-
-  double get pitchDelta => (_referencePitch == null) ? 0.0 : (currentPitch - _referencePitch!);
-
-  double get scaleDeltaPercent {
-    if (_referenceScale == null || _referenceScale == 0) {
-      return 0.0;
-    }
-    return ((_depthService.currentScale - _referenceScale!) / _referenceScale!) * 100.0;
-  }
-
-  double get scaleBarNormalized {
-    final double delta = (currentDistanceCm - targetDistanceCm) / 200.0;
-    return (0.5 + delta).clamp(0.0, 1.0);
-  }
-
-  void processCameraFrame(CameraImage image, int sensorOrientation) {
-    _depthService.onCameraImage(
-      image,
-      sensorOrientation: sensorOrientation,
+  // ── Position check ────────────────────────────────────────────────────────
+  PositionStatus? get positionStatus {
+    if (_appState != AppState.capture) return null;
+    final PlotPoint? target = activePlotPoint;
+    if (target == null) return null;
+    return _positionCheck.check(
+      target: target,
+      currentDistanceCm: depthService.currentDistanceCm,
+      currentBearingDeg: _currentBearing,
+      currentPitchDeg: _currentPitch,
     );
   }
 
-  Future<void> waitForFirstDepthFrame() {
-    return _depthService.waitForFirstFrame();
+  bool get isInPosition {
+    if (_appState == AppState.p1) return true;
+    return positionStatus?.allOK ?? false;
   }
 
-  Future<bool> setDepthPoint() {
-    return _depthService.setPoint(targetDistanceCm: targetDistanceCm);
+  // ── Depth frame passthrough ───────────────────────────────────────────────
+  bool get hasDepthFrame => depthService.hasFrame;
+  bool get hasAnchor => depthService.hasAnchor;
+  String? get trackingWarning => depthService.warningMessage;
+  bool get isUsingFallbackTracking => depthService.isUsingFallback;
+  double get currentDistanceCm => depthService.currentDistanceCm;
+
+  bool isAlbumUploaded(String albumId) => _uploadedAlbumIds.contains(albumId);
+
+  void processCameraFrame(CameraImage image, int sensorOrientation) {
+    depthService.onCameraImage(image, sensorOrientation: sensorOrientation);
   }
 
+  Future<void> waitForFirstDepthFrame() => depthService.waitForFirstFrame();
+
+  // ── Initialization ────────────────────────────────────────────────────────
   Future<void> _initialize() async {
-    _spatialService.start();
-    _spatialService.addListener(_onSpatialChange);
-    _depthService.addListener(_onDepthChange);
+    _compassSub = FlutterCompass.events?.listen((CompassEvent event) {
+      final double? heading = event.heading;
+      if (heading == null) return;
+      final double next = _normalizeDegrees(heading);
+      if ((_currentBearing - next).abs() < 0.5) return;
+      _currentBearing = next;
+      _scheduleNotify();
+    });
 
-    await _albumService.init();
-    albums = _albumService.getAllAlbums();
+    _accelSub = accelerometerEventStream(
+      samplingPeriod: SensorInterval.uiInterval,
+    ).listen((AccelerometerEvent event) {
+      final double next =
+          math.atan2(event.y, event.z) * 180 / math.pi;
+      if ((_currentPitch - next).abs() < 0.25) return;
+      _currentPitch = next;
+      _scheduleNotify();
+    });
 
-    _positionSubscription = Geolocator.getPositionStream(
+    depthService.addListener(_onDepthChange);
+
+    await albumService.init();
+    albums = albumService.getAllAlbums();
+
+    _positionSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.best,
         distanceFilter: 1,
       ),
     ).listen((Position position) {
-      currentLatitude = position.latitude;
-      currentLongitude = position.longitude;
+      _currentLatitude = position.latitude;
+      _currentLongitude = position.longitude;
       _scheduleNotify();
     });
 
@@ -160,25 +197,170 @@ class CameraProvider extends ChangeNotifier {
     _scheduleNotify(immediate: true);
   }
 
-  void _onSpatialChange() {
-    currentBearing = _spatialService.currentBearing;
-    currentPitch = _spatialService.currentPitch;
-    _recomputeSpatialValues();
-  }
-
   void _onDepthChange() {
-    _recomputeSpatialValues();
-  }
-
-  void _recomputeSpatialValues() {
-    if (currentAlbum != null) {
-      currentDistanceCm = _depthService.currentDistanceCm;
-    } else {
-      currentDistanceCm = 0.0;
-    }
     _scheduleNotify();
   }
 
+  // ── SET POINT ─────────────────────────────────────────────────────────────
+  Future<bool> setPoint() async {
+    if (!depthService.hasFrame) return false;
+
+    _anchorLat = _currentLatitude;
+    _anchorLng = _currentLongitude;
+    _anchorBearing = _currentBearing;
+
+    // 150 cm is the tracking reference; actual sphere radius comes from P1.
+    final bool ok = await depthService.setPoint(targetDistanceCm: 150);
+    if (!ok) return false;
+
+    _p1DistanceCm = null;
+    _p1AzimuthDeg = null;
+    _p1ElevationDeg = null;
+
+    _currentAlbum = Album(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: 'Album ${DateTime.now().toIso8601String()}',
+      anchorLatitude: _anchorLat,
+      anchorLongitude: _anchorLng,
+      anchorBearing: _anchorBearing,
+      pointsPerLayer: _pointsPerLayer,
+      numberOfLayers: _numberOfLayers,
+    );
+
+    albums.insert(0, _currentAlbum!);
+
+    _appState = AppState.p1;
+    _scheduleNotify(immediate: true);
+    return true;
+  }
+
+  // ── CAPTURE IMAGE ─────────────────────────────────────────────────────────
+  Future<void> captureImage(CameraController ctrl) async {
+    if (_appState == AppState.p1) {
+      // P1: no position check — shoot freely.
+      final XFile file = await ctrl.takePicture();
+
+      _p1DistanceCm = depthService.currentDistanceCm;
+      _p1AzimuthDeg = _currentBearing;
+      _p1ElevationDeg = _currentPitch;
+
+      final CapturedImage img = CapturedImage(
+        imagePath: file.path,
+        latitude: _currentLatitude,
+        longitude: _currentLongitude,
+        distanceCm: _p1DistanceCm!,
+        bearingAngle: _p1AzimuthDeg!,
+        heightDelta: _p1ElevationDeg!,
+        timestamp: DateTime.now(),
+      );
+      _currentAlbum!.images.add(img);
+
+      // Generate all sphere points from P1.
+      _currentAlbum!.plotPoints = _plotService.generatePoints(
+        pointsPerLayer: _pointsPerLayer,
+        numberOfLayers: _numberOfLayers,
+        p1AzimuthDeg: _p1AzimuthDeg!,
+        p1ElevationDeg: _p1ElevationDeg!,
+        p1DistanceCm: _p1DistanceCm!,
+      );
+
+      // P1 is index 0, already marked captured; next active = index 1.
+      _currentAlbum!.currentPointIndex = 1;
+
+      await albumService.saveAlbum(_currentAlbum!);
+      _appState = AppState.capture;
+      _scheduleNotify(immediate: true);
+      return;
+    }
+
+    if (_appState == AppState.capture) {
+      // P2+: position check required.
+      final PositionStatus? status = positionStatus;
+      if (status == null || !status.allOK) {
+        throw Exception('Not in position');
+      }
+
+      final XFile file = await ctrl.takePicture();
+      final CapturedImage img = CapturedImage(
+        imagePath: file.path,
+        latitude: _currentLatitude,
+        longitude: _currentLongitude,
+        distanceCm: depthService.currentDistanceCm,
+        bearingAngle: _currentBearing,
+        heightDelta: _currentPitch,
+        timestamp: DateTime.now(),
+      );
+      _currentAlbum!.images.add(img);
+
+      final int idx = _currentAlbum!.currentPointIndex;
+      _currentAlbum!.plotPoints[idx].isCaptured = true;
+
+      // Advance to next uncaptured point.
+      final int next = _currentAlbum!.plotPoints
+          .indexWhere((p) => !p.isCaptured, idx + 1);
+      if (next != -1) {
+        _currentAlbum!.currentPointIndex = next;
+      }
+
+      await albumService.saveAlbum(_currentAlbum!);
+      _scheduleNotify(immediate: true);
+    }
+  }
+
+  // ── UPLOAD ────────────────────────────────────────────────────────────────
+  Future<String> uploadAlbum([Album? album]) async {
+    final Album? target = album ?? _currentAlbum;
+    if (target == null) throw Exception('No album selected.');
+    if (!target.isComplete) throw Exception('Album is not complete.');
+
+    isUploading = true;
+    uploadProgress = 0.0;
+    lastDriveLink = null;
+    _scheduleNotify(immediate: true);
+
+    try {
+      final List<File> files =
+          target.images.map((e) => File(e.imagePath)).toList();
+      final String link = await driveService.uploadImages(
+        files: files,
+        onProgress: (double p) {
+          uploadProgress = p;
+          _scheduleNotify();
+        },
+      );
+      _uploadedAlbumIds.add(target.id);
+      lastDriveLink = link;
+      _scheduleNotify(immediate: true);
+      return link;
+    } finally {
+      isUploading = false;
+      _scheduleNotify(immediate: true);
+    }
+  }
+
+  // ── DELETE ALBUM ──────────────────────────────────────────────────────────
+  Future<void> deleteAlbum(String id) async {
+    await albumService.deleteAlbum(id);
+    albums.removeWhere((a) => a.id == id);
+    _uploadedAlbumIds.remove(id);
+    if (_currentAlbum?.id == id) {
+      resetToInitial();
+    }
+    _scheduleNotify(immediate: true);
+  }
+
+  // ── RESET ─────────────────────────────────────────────────────────────────
+  void resetToInitial() {
+    _appState = AppState.initial;
+    _currentAlbum = null;
+    _p1DistanceCm = null;
+    _p1AzimuthDeg = null;
+    _p1ElevationDeg = null;
+    depthService.clearAnchor();
+    _scheduleNotify(immediate: true);
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
   void _scheduleNotify({bool immediate = false}) {
     if (immediate) {
       _notifyTimer?.cancel();
@@ -196,9 +378,7 @@ class CameraProvider extends ChangeNotifier {
       return;
     }
 
-    if (_notifyTimer != null) {
-      return;
-    }
+    if (_notifyTimer != null) return;
 
     _notifyTimer = Timer(_minUiNotifyInterval - elapsed, () {
       _notifyTimer = null;
@@ -207,168 +387,19 @@ class CameraProvider extends ChangeNotifier {
     });
   }
 
-  Future<bool> setPoint(double lat, double lng, double bearing) async {
-    final bool anchorReady = await setDepthPoint();
-    if (!anchorReady) {
-      lastError = _depthService.warningMessage ?? 'No center object detected.';
-      _scheduleNotify(immediate: true);
-      return false;
-    }
-
-    await switchToCaptureState(lat, lng, bearing);
-    return true;
-  }
-
-  Future<void> switchToCaptureState(double lat, double lng, double bearing) async {
-
-    final Album album = Album(
-      id: DateTime.now().microsecondsSinceEpoch.toString(),
-      name: 'Album ${albums.length + 1}',
-      anchorLat: lat,
-      anchorLng: lng,
-      anchorBearing: bearing,
-      targetDistanceCm: targetDistanceCm,
-      images: <CapturedImage>[],
-    );
-
-    currentAlbum = album;
-    appState = AppState.capture;
-    _referenceScale = null;
-    _referenceBearing = null;
-    _referencePitch = null;
-
-    albums.insert(0, album);
-    await _albumService.saveAlbum(album);
-    _recomputeSpatialValues();
-    _scheduleNotify(immediate: true);
-  }
-
-  Future<void> captureImage(CameraController controller) async {
-    if (!isInPosition) {
-      lastError = 'You are not in position yet. Align distance, bearing, and height.';
-      _scheduleNotify(immediate: true);
-      throw Exception(lastError);
-    }
-
-    if (currentAlbum == null) {
-      lastError = 'No active album. Set point first.';
-      _scheduleNotify(immediate: true);
-      throw Exception(lastError);
-    }
-
-    final XFile image = await controller.takePicture();
-
-    final CapturedImage captured = CapturedImage(
-      imagePath: image.path,
-      latitude: currentLatitude,
-      longitude: currentLongitude,
-      distanceCm: currentDistanceCm,
-      bearingAngle: currentBearing,
-      heightDelta: currentPitch,
-      timestamp: DateTime.now(),
-    );
-
-    if (currentAlbum!.images.isEmpty) {
-      _referenceScale = _depthService.currentScale;
-      _referenceBearing = currentBearing;
-      _referencePitch = currentPitch;
-    }
-
-    currentAlbum!.images.add(captured);
-    await _albumService.saveAlbum(currentAlbum!);
-    lastError = null;
-    _scheduleNotify(immediate: true);
-  }
-
-  void setTargetDistance(double cm) {
-    targetDistanceCm = cm;
-    if (currentAlbum != null) {
-      currentAlbum = Album(
-        id: currentAlbum!.id,
-        name: currentAlbum!.name,
-        anchorLat: currentAlbum!.anchorLat,
-        anchorLng: currentAlbum!.anchorLng,
-        anchorBearing: currentAlbum!.anchorBearing,
-        targetDistanceCm: cm,
-        images: currentAlbum!.images,
-      );
-      final int index = albums.indexWhere((a) => a.id == currentAlbum!.id);
-      if (index != -1) {
-        albums[index] = currentAlbum!;
-      }
-      _albumService.saveAlbum(currentAlbum!);
-    }
-    _scheduleNotify(immediate: true);
-  }
-
-  Future<String> uploadAlbum([Album? album]) async {
-    final Album? target = album ?? currentAlbum;
-    if (target == null) {
-      throw Exception('No album selected.');
-    }
-    if (!target.isComplete) {
-      throw Exception('Album needs at least 4 images before upload.');
-    }
-
-    isUploading = true;
-    uploadProgress = 0.0;
-    lastDriveLink = null;
-    _scheduleNotify(immediate: true);
-
-    try {
-      final List<File> files = target.images.map((e) => File(e.imagePath)).toList();
-      final String link = await _driveService.uploadImages(
-        files: files,
-        onProgress: (double p) {
-          uploadProgress = p;
-          _scheduleNotify();
-        },
-      );
-      _uploadedAlbumIds.add(target.id);
-      lastDriveLink = link;
-      _scheduleNotify(immediate: true);
-      return link;
-    } finally {
-      isUploading = false;
-      _scheduleNotify(immediate: true);
-    }
-  }
-
-  Future<void> deleteAlbum(String id) async {
-    await _albumService.deleteAlbum(id);
-    albums.removeWhere((album) => album.id == id);
-    _uploadedAlbumIds.remove(id);
-    if (currentAlbum?.id == id) {
-      resetToInitial();
-    }
-    _scheduleNotify(immediate: true);
-  }
-
-  void resetPosition() {
-    _depthService.clearAnchor();
-    _recomputeSpatialValues();
-  }
-
-  void resetToInitial() {
-    currentAlbum = null;
-    appState = AppState.initial;
-    currentDistanceCm = 0.0;
-    currentPitch = 0.0;
-    _referenceScale = null;
-    _referenceBearing = null;
-    _referencePitch = null;
-    _depthService.clearAnchor();
-    _scheduleNotify(immediate: true);
+  double _normalizeDegrees(double angle) {
+    final double normalized = angle % 360.0;
+    return normalized < 0 ? normalized + 360.0 : normalized;
   }
 
   @override
   void dispose() {
     _notifyTimer?.cancel();
-    _positionSubscription?.cancel();
-    _spatialService.removeListener(_onSpatialChange);
-    _depthService.removeListener(_onDepthChange);
-    _spatialService.dispose();
-    _depthService.dispose();
+    _compassSub?.cancel();
+    _accelSub?.cancel();
+    _positionSub?.cancel();
+    depthService.removeListener(_onDepthChange);
+    depthService.dispose();
     super.dispose();
   }
 }

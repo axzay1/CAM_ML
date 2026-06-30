@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -8,7 +9,6 @@ import 'package:provider/provider.dart';
 import '../models/plot_point.dart';
 import '../providers/camera_provider.dart';
 import '../widgets/glass_container.dart';
-import '../widgets/guide_arrow_3d.dart';
 import 'album_screen.dart';
 
 class CameraScreen extends StatefulWidget {
@@ -336,6 +336,55 @@ class _CameraScreenState extends State<CameraScreen>
     );
   }
 
+  // ── Sphere ring overlay ───────────────────────────────────────────────────
+
+  Widget _buildSphereRingLayer(
+      CameraProvider provider, double screenW, double screenH) {
+    final points = provider.plotPoints;
+    if (points.isEmpty) return const SizedBox.shrink();
+
+    // Compute screen position for every plot point.
+    final spokes = points.map((p) {
+      final double bDelta =
+          _signedAngleDiff(provider.currentBearing, p.requiredBearing);
+      final double pDelta = provider.currentPitch - p.elevationDeg;
+      return _SpokeData(
+        pos: Offset(
+          screenW / 2 + (bDelta / 60).clamp(-1.0, 1.0) * screenW * 0.45,
+          screenH / 2 + (pDelta / 40).clamp(-1.0, 1.0) * screenH * 0.3,
+        ),
+        captured: p.isCaptured,
+        active: p.index == provider.activePlotPoint?.index,
+      );
+    }).toList();
+
+    // One ring per layer; height driven by pitch-vs-equator perspective.
+    final Map<int, List<PlotPoint>> byLayer = {};
+    for (final p in points) {
+      byLayer.putIfAbsent(p.layerIndex, () => []).add(p);
+    }
+    final rings = byLayer.values.map((layerPts) {
+      final double layerElev = layerPts.first.elevationDeg;
+      final double pitchDiff = provider.currentPitch - layerElev;
+      final double rx = screenW * 0.45;
+      final double ry =
+          (rx * math.sin(pitchDiff * math.pi / 180).abs()).clamp(6.0, rx * 0.4);
+      return _RingData(rx: rx, ry: ry);
+    }).toList();
+
+    return SizedBox(
+      width: screenW,
+      height: screenH,
+      child: CustomPaint(
+        painter: _SphereRingPainter(
+          spokes: spokes,
+          rings: rings,
+          center: Offset(screenW / 2, screenH / 2),
+        ),
+      ),
+    );
+  }
+
   // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
@@ -365,7 +414,11 @@ class _CameraScreenState extends State<CameraScreen>
                         _buildCenterCrosshair(provider),
                   ),
 
-                  // ── Layer 3: Floating point crosshairs ───────────────────
+                  // ── Layer 3a: Sphere ring + spokes ──────────────────────
+                  if (provider.appState == AppState.capture)
+                    _buildSphereRingLayer(provider, screenW, screenH),
+
+                  // ── Layer 3b: Floating point crosshairs ──────────────────
                   if (provider.appState == AppState.capture)
                     Positioned.fill(
                       child: Stack(
@@ -728,11 +781,15 @@ class _CameraScreenState extends State<CameraScreen>
   // ── Layer 5: Bottom bar ───────────────────────────────────────────────────
 
   Widget _buildBottomBar(CameraProvider provider) {
-    return Align(
-      alignment: Alignment.bottomCenter,
+    // Positioned gives tight width (screen − margins) but loose height so the
+    // bar shrinks to its content instead of expanding under loose 2-axis constraints.
+    return Positioned(
+      left: 12,
+      right: 12,
+      bottom: 0,
       child: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          padding: const EdgeInsets.only(bottom: 12),
           child: switch (provider.appState) {
             AppState.initial => _buildInitialBar(provider),
             AppState.p1 => _buildP1Bar(provider),
@@ -752,33 +809,15 @@ class _CameraScreenState extends State<CameraScreen>
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          // Left: pickers
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Points per layer',
-                style: TextStyle(color: Colors.white70, fontSize: 10),
-              ),
-              const SizedBox(height: 4),
-              _buildPills(
-                options: const [4, 8, 12],
-                selected: provider.pointsPerLayer,
-                onTap: provider.setPointsPerLayer,
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Layers',
-                style: TextStyle(color: Colors.white70, fontSize: 10),
-              ),
-              const SizedBox(height: 4),
-              _buildPills(
-                options: const [1, 2, 3, 4],
-                selected: provider.numberOfLayers,
-                onTap: provider.setNumberOfLayers,
-              ),
-            ],
+          // Left: settings
+          IconButton(
+            onPressed: () => _showSettingsDialog(provider),
+            icon: const Icon(Icons.tune, color: Colors.white70, size: 26),
+            style: IconButton.styleFrom(
+              backgroundColor: Colors.white.withValues(alpha: 0.1),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
+            ),
           ),
 
           // Center: SET POINT button
@@ -835,28 +874,86 @@ class _CameraScreenState extends State<CameraScreen>
     );
   }
 
+  void _showSettingsDialog(CameraProvider provider) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => Consumer<CameraProvider>(
+        builder: (ctx, p, _) => AlertDialog(
+          backgroundColor: const Color(0xFF1A1A2E),
+          title: const Text(
+            'Capture Settings',
+            style: TextStyle(color: Colors.white, fontSize: 16),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Points per layer',
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
+              const SizedBox(height: 8),
+              _buildPills(
+                options: const [4, 8, 12],
+                selected: p.pointsPerLayer,
+                onTap: p.setPointsPerLayer,
+              ),
+              const SizedBox(height: 16),
+              const Text('Layers',
+                  style: TextStyle(color: Colors.white70, fontSize: 12)),
+              const SizedBox(height: 8),
+              _buildPills(
+                options: const [1, 2, 3, 4],
+                selected: p.numberOfLayers,
+                onTap: p.setNumberOfLayers,
+              ),
+              const SizedBox(height: 14),
+              Text(
+                'Total: ${p.totalPoints} photos',
+                style: const TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildP1Bar(CameraProvider provider) {
     return GlassContainer(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          const Text(
-            'Shoot P1 from any position',
-            style: TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
-              fontSize: 13,
+          // Left: instruction text
+          Expanded(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Shoot P1 from any position',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  'Sets sphere R — ${provider.totalPoints} photos total',
+                  style: const TextStyle(color: Colors.white54, fontSize: 10),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 4),
-          Text(
-            'Sets sphere R for all ${provider.totalPoints} photos',
-            style:
-                const TextStyle(color: Colors.white54, fontSize: 10),
-          ),
-          const SizedBox(height: 12),
+          const SizedBox(width: 16),
+          // Right: shutter
           GestureDetector(
             onTap: _cameraController != null
                 ? () => _capturePhoto(provider)
@@ -869,8 +966,7 @@ class _CameraScreenState extends State<CameraScreen>
                 color: const Color(0xFF4CAF50),
                 boxShadow: [
                   BoxShadow(
-                    color: const Color(0xFF4CAF50)
-                        .withValues(alpha: 0.6),
+                    color: const Color(0xFF4CAF50).withValues(alpha: 0.6),
                     blurRadius: 18,
                     spreadRadius: 3,
                   ),
@@ -898,45 +994,17 @@ class _CameraScreenState extends State<CameraScreen>
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          // Left: stacked thumbnails
-          GestureDetector(
-            onTap: () => _openCapturedImagesDialog(provider),
-            child: SizedBox(
-              width: 68,
-              height: 68,
-              child: Stack(
-                clipBehavior: Clip.none,
-                children: [
-                  for (int i = 0;
-                      i < (images.length > 3 ? 3 : images.length);
-                      i++)
-                    Positioned(
-                      left: i * 8.0,
-                      top: i * 6.0,
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.file(
-                          File(images[i].imagePath),
-                          width: 44,
-                          height: 44,
-                          fit: BoxFit.cover,
-                        ),
-                      ),
-                    ),
-                  if (images.isEmpty)
-                    Container(
-                      width: 52,
-                      height: 52,
-                      decoration: BoxDecoration(
-                        color: Colors.white24,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: const Icon(
-                        Icons.photo_size_select_actual_outlined,
-                        color: Colors.white70,
-                      ),
-                    ),
-                ],
+          // Left: Cancel button
+          SizedBox(
+            width: 60,
+            child: Center(
+              child: IconButton(
+                onPressed: () => _cancelCapture(provider),
+                icon: const Icon(Icons.close, color: Colors.white70, size: 26),
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.red.withValues(alpha: 0.18),
+                  shape: const CircleBorder(),
+                ),
               ),
             ),
           ),
@@ -993,16 +1061,83 @@ class _CameraScreenState extends State<CameraScreen>
             ],
           ),
 
-          // Right: 3D guide arrow
-          GuideArrow3D(
-            bearingDelta: provider.positionStatus?.bearingDelta ?? 0,
-            distanceDelta: provider.positionStatus?.distanceDelta ?? 0,
-            heightDelta: provider.positionStatus?.pitchDelta ?? 0,
-            targetDistanceCm: provider.sphereRadiusCm ?? 150,
+          // Right: stacked thumbnails (gallery)
+          GestureDetector(
+            onTap: () => _openCapturedImagesDialog(provider),
+            child: SizedBox(
+              width: 60,
+              height: 68,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  for (int i = 0;
+                      i < (images.length > 3 ? 3 : images.length);
+                      i++)
+                    Positioned(
+                      left: i * 7.0,
+                      top: i * 5.0,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.file(
+                          File(images[i].imagePath),
+                          width: 42,
+                          height: 42,
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                    ),
+                  if (images.isEmpty)
+                    Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(
+                        Icons.photo_size_select_actual_outlined,
+                        color: Colors.white70,
+                        size: 22,
+                      ),
+                    ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _cancelCapture(CameraProvider provider) async {
+    final String? albumId = provider.currentAlbum?.id;
+    if (albumId == null) return;
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A2E),
+        title: const Text('Cancel Capture?',
+            style: TextStyle(color: Colors.white)),
+        content: const Text(
+          'This will delete the current album and all captured photos.',
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Keep'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete',
+                style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      await provider.deleteAlbum(albumId);
+    }
   }
 
   Widget _buildStatusChips(CameraProvider provider) {
@@ -1077,6 +1212,100 @@ class _CameraScreenState extends State<CameraScreen>
       }).toList(),
     );
   }
+}
+
+// ── Sphere ring painter ────────────────────────────────────────────────────
+
+class _SpokeData {
+  const _SpokeData({
+    required this.pos,
+    required this.captured,
+    required this.active,
+  });
+  final Offset pos;
+  final bool captured;
+  final bool active;
+}
+
+class _RingData {
+  const _RingData({required this.rx, required this.ry});
+  final double rx;
+  final double ry;
+}
+
+class _SphereRingPainter extends CustomPainter {
+  const _SphereRingPainter({
+    required this.spokes,
+    required this.rings,
+    required this.center,
+  });
+
+  final List<_SpokeData> spokes;
+  final List<_RingData> rings;
+  final Offset center;
+
+  static const Color _green = Color(0xFF4CAF50);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    // Draw rings (one per elevation layer).
+    final Paint ringPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.8
+      ..color = Colors.white.withValues(alpha: 0.22);
+    for (final r in rings) {
+      canvas.drawOval(
+        Rect.fromCenter(
+            center: center, width: r.rx * 2, height: r.ry * 2),
+        ringPaint,
+      );
+    }
+
+    // Draw spokes (center → each plot point).
+    for (final s in spokes) {
+      final Color lineColor = s.captured
+          ? _green.withValues(alpha: 0.5)
+          : s.active
+              ? Colors.white.withValues(alpha: 0.75)
+              : Colors.white.withValues(alpha: 0.18);
+      final Paint p = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = s.active ? 1.2 : 0.8
+        ..color = lineColor;
+
+      if (!s.captured && !s.active) {
+        _drawDashed(canvas, center, s.pos, p);
+      } else {
+        canvas.drawLine(center, s.pos, p);
+      }
+    }
+  }
+
+  void _drawDashed(Canvas canvas, Offset a, Offset b, Paint p) {
+    final double dx = b.dx - a.dx;
+    final double dy = b.dy - a.dy;
+    final double len = math.sqrt(dx * dx + dy * dy);
+    if (len < 1) return;
+    final double ux = dx / len;
+    final double uy = dy / len;
+    double t = 0;
+    bool draw = true;
+    while (t < len) {
+      final double t2 = math.min(t + (draw ? 6.0 : 4.0), len);
+      if (draw) {
+        canvas.drawLine(
+          Offset(a.dx + ux * t, a.dy + uy * t),
+          Offset(a.dx + ux * t2, a.dy + uy * t2),
+          p,
+        );
+      }
+      t = t2;
+      draw = !draw;
+    }
+  }
+
+  @override
+  bool shouldRepaint(_SphereRingPainter old) => true;
 }
 
 // ── Standalone painter ─────────────────────────────────────────────────────
